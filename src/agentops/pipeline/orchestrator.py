@@ -267,7 +267,12 @@ def _run_evaluation_local_snapshot(
 
     _finalize_commit_and_comparison(result, options)
 
-    _persist(result, options.output_dir)
+    _persist(
+        result,
+        options.output_dir,
+        workspace=options.config_path.parent,
+        commit_resolution_attempted=True,
+    )
 
     # Local execution only ever publishes to Classic Foundry. Cloud
     # execution goes through _run_evaluation_cloud and never reaches here.
@@ -546,7 +551,12 @@ def _run_evaluation_cloud_snapshot(
 
     _finalize_commit_and_comparison(result, options)
 
-    _persist(result, options.output_dir)
+    _persist(
+        result,
+        options.output_dir,
+        workspace=options.config_path.parent,
+        commit_resolution_attempted=True,
+    )
 
     # Write cloud_evaluation.json next to the other artifacts for parity
     # with the (now-removed) post-run cloud publish path.
@@ -675,7 +685,12 @@ def _run_evaluation_azd_legacy(
 
     _finalize_commit_and_comparison(result, options)
 
-    _persist(result, options.output_dir)
+    _persist(
+        result,
+        options.output_dir,
+        workspace=options.config_path.parent,
+        commit_resolution_attempted=True,
+    )
     azd_runner.write_raw_artifacts(azd_run, options.output_dir)
     return result
 
@@ -743,7 +758,12 @@ def _run_evaluation_azd_current(
 
     _finalize_commit_and_comparison(result, options)
 
-    _persist(result, options.output_dir)
+    _persist(
+        result,
+        options.output_dir,
+        workspace=options.config_path.parent,
+        commit_resolution_attempted=True,
+    )
     return result
 
 
@@ -1126,24 +1146,44 @@ def _finalize_commit_and_comparison(result: RunResult, options: RunOptions) -> N
     only at persist time (after the comparison already ran) would always
     leave ``current.commit`` unset for this call.
     """
+    workspace = options.config_path.parent
     if result.commit is None:
-        result.commit = resolve_commit_info()
+        result.commit = resolve_commit_info(workspace=workspace)
     if options.baseline_path is not None:
         baseline = comparison_module.load_baseline(options.baseline_path)
         result.comparison = comparison_module.build_comparison(
             current=result,
             baseline=baseline,
             baseline_path=options.baseline_path,
+            workspace=workspace,
         )
 
 
-def _persist(result: RunResult, output_dir: Path) -> None:
+def _persist(
+    result: RunResult,
+    output_dir: Path,
+    *,
+    workspace: Path,
+    commit_resolution_attempted: bool = False,
+) -> None:
+    """Write ``results.json``/``report.md``.
+
+    ``commit_resolution_attempted`` lets a caller that already tried
+    resolving the commit (``_finalize_commit_and_comparison``, which every
+    current call site runs immediately before this) signal that a second
+    attempt here would just repeat the same (possibly failed, possibly
+    5-second-timeout-each) git subprocess calls for the identical result -
+    this skips that retry rather than paying the cost twice for no new
+    information. A direct caller that skipped
+    ``_finalize_commit_and_comparison`` still gets the fallback, since the
+    default is ``False``.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.json"
     report_path = output_dir / "report.md"
 
-    if result.commit is None:
-        result.commit = resolve_commit_info()
+    if result.commit is None and not commit_resolution_attempted:
+        result.commit = resolve_commit_info(workspace=workspace)
 
     payload = result.model_dump(mode="json")
     results_path.write_text(
