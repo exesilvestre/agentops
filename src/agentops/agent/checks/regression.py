@@ -37,7 +37,7 @@ def _load_run_result(summary: RunSummary) -> Optional[RunResult]:
 
 def _attribution_unavailable_reason(
     latest: RunSummary,
-    previous_run: RunSummary,
+    previous_run: Optional[RunSummary],
     latest_result: Optional[RunResult],
     previous_result: Optional[RunResult],
 ) -> str:
@@ -51,6 +51,8 @@ def _attribution_unavailable_reason(
     ``agentops eval run`` (including ``execution: cloud``/``azd``), which
     always attempts commit capture.
     """
+    if previous_run is None:
+        return "attribution unavailable: no comparable prior run found"
     non_local = [
         run
         for run, result in ((latest, latest_result), (previous_run, previous_result))
@@ -79,34 +81,45 @@ def run_regression_check(
         return []
 
     latest = runs[-1]
-    # Only compare against runs that share the same dataset, evaluators,
-    # and agent identity - but deliberately version/deployment-*blind*
-    # (`lineage_key`, not the finer `methodology_fingerprint` opex.py's
-    # flaky-metric check needs, which does want version included since
-    # mixing versions there would inflate variance spuriously). A version
-    # bump is exactly the kind of change this check - and its causal
-    # attribution - exists to catch, not an incompatible methodology to
-    # exclude: keying this on the fingerprint instead would make the
-    # check structurally unable to fire on the first run(s) after a
-    # version bump (there being no baseline yet sharing that new,
-    # not-yet-established fingerprint), making the feature's own
-    # canonical "run v3 -> v4" scenario unreachable.
-    lineage_key = latest.lineage_key
-    if lineage_key is None:
+    # Only compare against runs that share the same evaluation methodology
+    # (same agent target, dataset, and evaluator set) - this is Doctor's
+    # pre-existing rolling-baseline detection rule, unchanged by this
+    # feature. Changing *whether*/*how sensitively* a regression is
+    # detected is out of scope here: this feature only adds a causal
+    # explanation once a regression has already been detected the same
+    # way it always was.
+    fingerprint = latest.methodology_fingerprint
+    if fingerprint is None:
         baseline_runs = runs[:-1]
     else:
-        baseline_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
+        baseline_runs = [
+            r for r in runs[:-1] if r.methodology_fingerprint == fingerprint
+        ]
     if len(baseline_runs) + 1 < config.min_runs:
         return []
     if not baseline_runs:
         return []
 
     # The immediately preceding comparable run, for causal attribution -
-    # distinct from the rolling drop% mean below, which uses every
-    # comparable run, not just the last one.
-    previous_run = baseline_runs[-1]
+    # distinct from `baseline_runs` above (detection's rolling drop% mean,
+    # left untouched). Deliberately keyed on the coarser `lineage_key`
+    # (dataset, evaluators, agent identity - version/deployment excluded)
+    # rather than `baseline_runs`/`methodology_fingerprint`: when a
+    # regression *has* been detected and happens to coincide with a
+    # version bump, the fingerprint would exclude the pre-bump run from
+    # `baseline_runs`, so picking the comparison partner from there could
+    # silently skip over it and attribute the cause to an older, less
+    # relevant run instead. This only changes which run an *already-fired*
+    # finding is explained against, never whether one fires.
+    lineage_key = latest.lineage_key
+    if lineage_key is None:
+        lineage_runs = runs[:-1]
+    else:
+        lineage_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
+    previous_run = lineage_runs[-1] if lineage_runs else None
+
     latest_result = _load_run_result(latest)
-    previous_result = _load_run_result(previous_run)
+    previous_result = _load_run_result(previous_run) if previous_run is not None else None
 
     findings: List[Finding] = []
     for metric in config.metrics:
