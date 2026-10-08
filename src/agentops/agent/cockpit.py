@@ -39,6 +39,7 @@ from agentops.core.governance import (
     summarize_redteam_readiness,
 )
 from agentops.core.results import RunResult
+from agentops.pipeline.comparison import LOWER_IS_BETTER_METRICS, metric_improved
 from agentops.pipeline.regression_insight import build_changed_inputs
 from agentops.utils.yaml import load_yaml
 
@@ -348,7 +349,7 @@ def _build_metrics_cards(eval_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]
         alt_links = [r.get("alt_link") for r, _v in paired]
         alt_labels = [r.get("alt_label") for r, _v in paired]
         latest = series[-1]
-        is_latency = key == "avg_latency_seconds"
+        is_latency = key in LOWER_IS_BETTER_METRICS
         badge = _metric_trend_badge(series, is_latency=is_latency)
         cards.append({
             "key": key,
@@ -854,7 +855,10 @@ def _build_eval_history_section(eval_runs: List[Dict[str, Any]]) -> Dict[str, An
                 "commit_subject": commit.get("subject") if commit else None,
                 "changed_inputs": run.get("changed_inputs") or [],
                 "regressed": bool(run.get("regressed")),
+                "regressed_metrics": run.get("regressed_metrics") or [],
                 "report_link": run.get("report_link"),
+                "cloud_report_url": run.get("cloud_report_url"),
+                "previous_cloud_report_url": run.get("previous_cloud_report_url"),
             }
         )
     return {"has_runs": True, "entries": entries}
@@ -927,40 +931,100 @@ def _version_lineage_key(data: Dict[str, Any]) -> Optional[str]:
 
 
 def _attach_version_history(runs: List[Dict[str, Any]]) -> None:
-    """Fill in ``changed_inputs``/``regressed`` for each run, in place.
+    """Fill in ``changed_inputs``/``regressed``/``previous_cloud_report_url``
+    for each run, in place.
 
     Compares each run against the previous entry (in the already
     oldest-to-newest ordered ``runs`` list) that shares the same
-    ``methodology_fingerprint`` - the same grouping key Doctor's regression
-    check and ``results_history`` already use. A run with no fingerprint or
-    no prior comparable run gets an empty ``changed_inputs`` list, not a
+    ``version_lineage_key`` (see ``_version_lineage_key`` above) - *not*
+    the same thing as Doctor's rolling regression check's
+    ``methodology_fingerprint`` grouping (``results_history``): that one is
+    deliberately finer (version/deployment included), so it treats a
+    version bump as a new methodology and excludes it from the rolling
+    baseline, whereas this view groups *across* version bumps on purpose,
+    since showing what changed across them is the point. A run with no key
+    or no prior comparable run gets an empty ``changed_inputs`` list, not a
     fabricated one. The private ``_full_result`` helper key (a parsed
     ``RunResult``, not JSON-safe) is removed before returning.
     """
-    last_by_fingerprint: Dict[str, RunResult] = {}
+    last_by_lineage_key: Dict[str, RunResult] = {}
+    last_cloud_report_url_by_lineage_key: Dict[str, Optional[str]] = {}
     for run in runs:
-        fingerprint = run.get("methodology_fingerprint")
+        lineage_key = run.get("version_lineage_key")
         current_full = cast(Optional[RunResult], run.pop("_full_result", None))
         run["changed_inputs"] = []
         run["regressed"] = False
+        run["regressed_metrics"] = []
+        # The previous comparable run's own Foundry Evaluations link (its
+        # `cloud_report_url`, never the local-report fallback - omitted
+        # the same way `RegressionInsight.from_report_url` is when that
+        # run was never published), so a regressed row can link out to
+        # both sides of the comparison, not just its own.
+        run["previous_cloud_report_url"] = None
 
-        if fingerprint is not None:
-            previous_full = last_by_fingerprint.get(fingerprint)
+        if lineage_key is not None:
+            previous_full = last_by_lineage_key.get(lineage_key)
             if previous_full is not None and current_full is not None:
                 changes = build_changed_inputs(previous_full, current_full)
                 run["changed_inputs"] = [c.model_dump(mode="json") for c in changes]
                 shared_metrics = set(previous_full.aggregate_metrics) & set(
                     current_full.aggregate_metrics
                 )
-                run["regressed"] = any(
-                    current_full.aggregate_metrics[m] < previous_full.aggregate_metrics[m]
+                # Named, not just a boolean, so a run that regressed on
+                # several metrics at once doesn't read the same as one that
+                # regressed on a single metric.
+                run["regressed_metrics"] = sorted(
+                    m
                     for m in shared_metrics
+                    if metric_improved(
+                        m,
+                        current_full.aggregate_metrics[m],
+                        previous_full.aggregate_metrics[m],
+                    )
+                    is False
+                )
+                run["regressed"] = bool(run["regressed_metrics"])
+                run["previous_cloud_report_url"] = last_cloud_report_url_by_lineage_key.get(
+                    lineage_key
                 )
             if current_full is not None:
-                last_by_fingerprint[fingerprint] = current_full
+                last_by_lineage_key[lineage_key] = current_full
+                last_cloud_report_url_by_lineage_key[lineage_key] = run.get(
+                    "cloud_report_url"
+                )
+
+
+# Keyed by results.json path, holding (mtime, projected dict) - avoids
+# re-reading, re-parsing, and re-validating the same completed run (a
+# `RunResult.model_validate` over every row/metric, not cheap) on every
+# cockpit render. Safe to reuse across renders because a run's
+# `results.json` is written once and never mutated afterwards; `mtime` is
+# still checked so a changed file (e.g. a replayed/overwritten run during
+# development) isn't served stale. Each lookup returns a shallow copy so
+# `_attach_version_history`'s in-place `run[...] = ...` / `run.pop(...)`
+# on the result never corrupts the cached entry.
+_PROJECT_RUN_CACHE: Dict[Path, Tuple[float, Optional[Dict[str, Any]]]] = {}
 
 
 def _project_run(path: Path, *, run_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    if mtime is not None:
+        cached = _PROJECT_RUN_CACHE.get(path)
+        if cached is not None and cached[0] == mtime:
+            cached_projection = cached[1]
+            return dict(cached_projection) if cached_projection is not None else None
+
+    projection = _project_run_uncached(path, run_id=run_id)
+    if mtime is not None:
+        _PROJECT_RUN_CACHE[path] = (mtime, dict(projection) if projection is not None else None)
+    return projection
+
+
+def _project_run_uncached(path: Path, *, run_id: str) -> Optional[Dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1019,7 +1083,7 @@ def _project_run(path: Path, *, run_id: str) -> Optional[Dict[str, Any]]:
         "alt_link": alt_link,
         "alt_label": alt_label,
         "commit": commit if isinstance(commit, dict) else None,
-        "methodology_fingerprint": _version_lineage_key(data),
+        "version_lineage_key": _version_lineage_key(data),
         # Internal only - consumed and removed by `_attach_version_history`.
         "_full_result": full_result,
     }
@@ -4340,9 +4404,34 @@ def _render_eval_history_section(eval_history: Dict[str, Any]) -> str:
         else:
             changes_html = '<span class="muted">no tracked changes</span>'
 
+        regressed_metrics = entry.get("regressed_metrics") or []
         regressed_badge = (
-            '<span class="pillar-chip chip-crit">regressed</span>'
-            if entry.get("regressed")
+            '<span class="pillar-chip chip-crit">regressed: '
+            f'{_html_escape(", ".join(regressed_metrics))}</span>'
+            if regressed_metrics
+            else ""
+        )
+        # Links to both sides of the comparison in Foundry, when each was
+        # published there - same data as RegressionInsight.from_report_url/
+        # to_report_url, omitted silently when a side was never published
+        # (e.g. local execution with no `publish: true`). Only shown
+        # alongside the regressed badge; every row already links to its
+        # own report via run_label regardless of whether it regressed.
+        foundry_links: List[str] = []
+        if regressed_metrics:
+            previous_cloud_url = entry.get("previous_cloud_report_url")
+            current_cloud_url = entry.get("cloud_report_url")
+            if previous_cloud_url:
+                foundry_links.append(
+                    f'<a href="{_html_escape(str(previous_cloud_url))}">baseline in Foundry</a>'
+                )
+            if current_cloud_url:
+                foundry_links.append(
+                    f'<a href="{_html_escape(str(current_cloud_url))}">this run in Foundry</a>'
+                )
+        foundry_links_html = (
+            f' <span class="history-foundry-links">{" &middot; ".join(foundry_links)}</span>'
+            if foundry_links
             else ""
         )
         report_link = entry.get("report_link")
@@ -4352,7 +4441,7 @@ def _render_eval_history_section(eval_history: Dict[str, Any]) -> str:
 
         rows.append(
             '<div class="history-row">'
-            f'<div class="history-run">{run_label} {regressed_badge}</div>'
+            f'<div class="history-run">{run_label} {regressed_badge}{foundry_links_html}</div>'
             f'<div class="history-meta">{timestamp} &middot; {commit_html}</div>'
             f'<div class="history-metrics">{metrics_html}</div>'
             f'<div class="history-changes">{changes_html}</div>'
@@ -5091,6 +5180,10 @@ _COCKPIT_TEMPLATE = """<!doctype html>
   }}
   .history-run {{ font-size: 13px; font-weight: 600; color: var(--text); }}
   .history-run a {{ color: inherit; }}
+  .history-foundry-links {{
+    font-size: 11px; font-weight: 400; color: var(--text-dim);
+  }}
+  .history-foundry-links a {{ color: var(--accent); }}
   .history-meta {{
     font-size: 12px; color: var(--text-dim); margin-top: 2px;
   }}
