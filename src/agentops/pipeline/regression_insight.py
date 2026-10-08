@@ -40,46 +40,105 @@ _SUGGESTION_LABELS: Dict[str, str] = {
     "thresholds": "threshold change",
 }
 
-# Metrics where a lower value is the better outcome. Every other metric
-# (and every evaluator's default threshold - see `core/evaluators.py`,
-# where this is the only metric with a `<=` default) is treated as
-# higher-is-better. Lives here (rather than `pipeline.comparison`, its only
-# other consumer) because this module has no dependency on `comparison`,
-# while `comparison` already depends on this module for
-# `build_regression_insight` - putting it here avoids a circular import.
+# Fallback for metrics with no threshold criteria recorded on either
+# compared run - every evaluator's default threshold (see
+# `core/evaluators.py`) is `>=` except this one (`<=`). Only a fallback:
+# `agentops.yaml` lets *any* metric name declare a `<`/`<=` threshold
+# (and `execution: azd` can introduce entirely custom metric names this
+# way - see AGENTS.md), so a metric's own recorded `ThresholdEvaluation`
+# criteria (see `_threshold_criteria`) is the real source of truth
+# whenever it's available; this set only covers the common case where
+# neither compared run happens to carry one. Lives here (rather than
+# `pipeline.comparison`, its only other consumer) because this module has
+# no dependency on `comparison`, while `comparison` already depends on
+# this module for `build_regression_insight` - putting it here avoids a
+# circular import.
 LOWER_IS_BETTER_METRICS = frozenset({"avg_latency_seconds"})
 
 
+def _threshold_criteria(run: RunResult, metric: str) -> Optional[str]:
+    """The ``<=``/``>=``/etc. operator configured for ``metric`` on ``run``,
+    from its own recorded ``ThresholdEvaluation`` list, if any."""
+    for threshold in run.thresholds:
+        if threshold.metric == metric:
+            return threshold.criteria
+    return None
+
+
+def metric_threshold_criteria(
+    metric: str, *runs: Optional[RunResult]
+) -> Optional[str]:
+    """The first threshold criteria found for ``metric`` across ``runs``,
+    checked in order - callers typically pass the current/latest run
+    first, then the baseline/previous one, so either side recording a
+    threshold for this metric is enough to know its direction."""
+    for run in runs:
+        if run is None:
+            continue
+        criteria = _threshold_criteria(run, metric)
+        if criteria is not None:
+            return criteria
+    return None
+
+
+def _is_lower_is_better(metric: str, *, criteria: Optional[str] = None) -> bool:
+    """Whether a lower value is the better outcome for ``metric``.
+
+    ``criteria`` (a recorded threshold operator like ``"<="``, from
+    ``metric_threshold_criteria``) wins when given - it reflects what this
+    specific metric was actually configured to mean, unlike
+    ``LOWER_IS_BETTER_METRICS``, which is only a fallback guess for the one
+    built-in metric known to commonly be lower-is-better.
+    """
+    if criteria is not None:
+        if criteria.startswith("<"):
+            return True
+        if criteria.startswith(">"):
+            return False
+    return metric in LOWER_IS_BETTER_METRICS
+
+
 def metric_improved(
-    metric: str, current: Optional[float], baseline: Optional[float]
+    metric: str,
+    current: Optional[float],
+    baseline: Optional[float],
+    *,
+    criteria: Optional[str] = None,
 ) -> Optional[bool]:
     """Whether ``current`` is a better outcome than ``baseline`` for ``metric``.
 
     Returns ``None`` when the values are missing or equal (no judgement to
     make), ``True`` when ``current`` is the better value, ``False`` when
-    it's worse - accounting for ``metric`` being lower-is-better (e.g.
-    latency) vs. the higher-is-better default.
+    it's worse - accounting for ``metric``'s direction (see
+    ``_is_lower_is_better``).
     """
     if current is None or baseline is None or current == baseline:
         return None
-    if metric in LOWER_IS_BETTER_METRICS:
+    if _is_lower_is_better(metric, criteria=criteria):
         return current < baseline
     return current > baseline
 
 
-def regression_severity(metric: str, from_value: float, to_value: float) -> float:
+def regression_severity(
+    metric: str,
+    from_value: float,
+    to_value: float,
+    *,
+    criteria: Optional[str] = None,
+) -> float:
     """How severely ``metric`` regressed from ``from_value`` to ``to_value``,
     as a fraction of ``from_value`` when that's meaningful, else as an
     absolute change. Used only to order ``RegressionInsight.regressed_metrics``
-    worst-first - direction-aware, so a lower-is-better metric (e.g.
-    latency) getting worse produces a positive value just like any other
-    regression. A ``from_value`` at or below zero can't produce a
-    meaningful ratio, so the absolute change is used instead of collapsing
-    to zero.
+    worst-first - direction-aware (see ``_is_lower_is_better``), so a
+    lower-is-better metric (e.g. latency, or any custom metric with a
+    ``<=``/``<`` threshold) getting worse produces a positive value just
+    like any other regression. A ``from_value`` at or below zero can't
+    produce a meaningful ratio, so the absolute change is used instead of
+    collapsing to zero.
     """
     worse_by = (
         to_value - from_value
-        if metric in LOWER_IS_BETTER_METRICS
+        if _is_lower_is_better(metric, criteria=criteria)
         else from_value - to_value
     )
     if worse_by <= 0:
@@ -307,7 +366,12 @@ def build_regression_insight(
     if not regressed_metrics:
         return None
     regressed_metrics.sort(
-        key=lambda m: regression_severity(m.metric, m.from_value, m.to_value),
+        key=lambda m: regression_severity(
+            m.metric,
+            m.from_value,
+            m.to_value,
+            criteria=metric_threshold_criteria(m.metric, to_run, from_run),
+        ),
         reverse=True,
     )
 

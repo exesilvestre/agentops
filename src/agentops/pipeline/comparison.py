@@ -16,6 +16,7 @@ from agentops.pipeline.regression_insight import (
     LOWER_IS_BETTER_METRICS,
     build_regression_insight,
     metric_improved,
+    metric_threshold_criteria,
     resolve_report_url,
 )
 
@@ -34,8 +35,14 @@ def load_baseline(path: Path) -> RunResult:
     return RunResult.model_validate(payload)
 
 
-def _direction(metric: str, current: Optional[float], baseline: Optional[float]) -> str:
-    improved = metric_improved(metric, current, baseline)
+def _direction(
+    metric: str,
+    current: Optional[float],
+    baseline: Optional[float],
+    *,
+    criteria: Optional[str] = None,
+) -> str:
+    improved = metric_improved(metric, current, baseline, criteria=criteria)
     if improved is None:
         return "unchanged"
     return "improved" if improved else "regressed"
@@ -69,7 +76,12 @@ def build_comparison(
                 current=current_value,
                 baseline=baseline_value,
                 delta=delta,
-                direction=_direction(name, current_value, baseline_value),
+                direction=_direction(
+                    name,
+                    current_value,
+                    baseline_value,
+                    criteria=metric_threshold_criteria(name, current, baseline),
+                ),
             )
         )
 

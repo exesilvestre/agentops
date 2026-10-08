@@ -40,6 +40,7 @@ from agentops.core.governance import (
 )
 from agentops.core.results import RunResult
 from agentops.pipeline.comparison import LOWER_IS_BETTER_METRICS, metric_improved
+from agentops.pipeline.regression_insight import metric_threshold_criteria
 from agentops.pipeline.regression_insight import build_changed_inputs
 from agentops.utils.yaml import load_yaml
 
@@ -1009,6 +1010,7 @@ def _attach_version_history(runs: List[Dict[str, Any]]) -> None:
                         m,
                         current_full.aggregate_metrics[m],
                         previous_full.aggregate_metrics[m],
+                        criteria=metric_threshold_criteria(m, current_full, previous_full),
                     )
                     is False
                 )

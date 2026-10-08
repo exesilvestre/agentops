@@ -14,6 +14,7 @@ from agentops.core.results import RegressionInsight, RunResult
 from agentops.pipeline.regression_insight import (
     build_regression_insight,
     metric_improved,
+    metric_threshold_criteria,
     resolve_report_url,
 )
 
@@ -179,7 +180,8 @@ def run_regression_check(
             # fabricating a misleading explanation.
             previous_value = previous_result.aggregate_metrics.get(metric)
             latest_value = latest_result.aggregate_metrics.get(metric)
-            if metric_improved(metric, latest_value, previous_value) is False:
+            criteria = metric_threshold_criteria(metric, latest_result, previous_result)
+            if metric_improved(metric, latest_value, previous_value, criteria=criteria) is False:
                 insight = build_regression_insight(
                     previous_result,
                     latest_result,
