@@ -19,6 +19,7 @@ without publishing a new version produces no ``system_prompt`` entry in
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -319,39 +320,96 @@ def _suggested_action(changed_inputs: List[ChangedInput]) -> Optional[str]:
     return f"Review the {_join_with_and(labels)}; consider reverting one at a time to isolate the cause."
 
 
-def _agent_identity(target: TargetInfo) -> Optional[str]:
-    """Mirrors ``cockpit._version_lineage_key``'s / ``results_history._lineage_key``'s
-    dict-based ``agent_identity`` resolution, for a ``RunResult.target``
-    (``TargetInfo``) directly - see those functions' docstrings for why
-    ``url`` wins over ``name``, and why ``model_direct`` uses ``kind``
-    rather than ``raw``.
+# Matches the `/versions/<version>` segment a Foundry hosted-agent URL
+# carries (see `core.agentops_config._HOSTED_AGENT_REFERENCE_RE` - the
+# same pattern, kept independent since `core/` must stay free of
+# `pipeline`/`agent` imports). A hosted agent's `url` is otherwise the
+# strongest identity signal available (project + agent name, already
+# qualified) - but it's version-specific, so used as-is it would make
+# every version bump start a new lineage, exactly the change this feature
+# exists to compare across.
+_HOSTED_AGENT_VERSION_RE = re.compile(r"/versions/[^/?#]+", re.IGNORECASE)
+
+
+def normalize_agent_url(url: str) -> str:
+    """Strip the ``/versions/<version>`` segment from a Foundry hosted
+    agent URL, keeping the project+agent-qualified rest of it intact."""
+    return _HOSTED_AGENT_VERSION_RE.sub("", url)
+
+
+def agent_identity_from_fields(
+    *,
+    name: Optional[str],
+    url: Optional[str],
+    kind: Optional[str],
+    raw: Optional[str],
+) -> Optional[str]:
+    """Shared agent-identity resolution for lineage grouping - the single
+    source of truth used by ``cockpit._version_lineage_key``,
+    ``results_history._lineage_key``, and this module's
+    ``_agent_identity`` (``RunResult``-based), so the three can't drift
+    apart again.
+
+    ``url`` wins over ``name`` when both are present: for
+    ``foundry_hosted``, ``name`` is only the agent-name fragment parsed
+    *out of* that same URL (see ``TargetInfo``'s docstring), so two
+    different Foundry projects with a same-named agent would otherwise
+    collide on an identical, project-blind ``name``. The URL itself is
+    normalized (``normalize_agent_url``) to strip its version segment, so
+    a version bump doesn't start a new lineage - the opposite of using
+    ``name`` alone, which is already version-blind.
+
+    ``raw`` is the fallback for every remaining kind except
+    ``model_direct`` (``model:<deployment>``), where ``raw`` itself embeds
+    the deployment (e.g. ``"model:gpt-4o"`` vs ``"model:gpt-4o-mini"``) -
+    using it there would make a deployment change look like a different
+    agent entirely. ``kind`` has no such problem: it's the constant
+    ``"model_direct"`` for every run of this kind.
+
+    Known gap, not fixed here: ``foundry_prompt`` has neither ``url`` nor
+    any other project-qualified field - just ``name``/``version`` - so two
+    different projects with a same-named prompt agent still collide.
+    Fixing that needs a new field capturing the project endpoint on
+    ``TargetInfo`` for prompt agents, which is a bigger, separate change.
     """
-    if target.url:
-        return target.url
-    if target.name:
-        return target.name
-    if target.kind == "model_direct":
-        return target.kind
-    return target.raw
+    if url:
+        return normalize_agent_url(url)
+    if name:
+        return name
+    if kind == "model_direct":
+        return kind
+    return raw
+
+
+def _agent_identity(target: TargetInfo) -> Optional[str]:
+    """``agent_identity_from_fields`` for a ``RunResult.target`` directly."""
+    return agent_identity_from_fields(
+        name=target.name, url=target.url, kind=target.kind, raw=target.raw
+    )
 
 
 def same_lineage(from_run: RunResult, to_run: RunResult) -> bool:
     """Whether two runs are comparable for causal regression attribution
-    (FR-005): same dataset, evaluator set, and agent identity - but
-    deliberately version/deployment-blind, matching the lineage rule
-    Doctor's own ``previous_run`` selection already enforces by
-    construction (see ``agent.checks.regression``). An explicit
-    ``--baseline`` file has no such guarantee built in (the user can point
-    it at any ``results.json``), so ``build_regression_insight`` checks
-    this itself rather than trusting every caller to have already
-    filtered for it - comparing two runs of different agents, datasets, or
-    evaluator sets could otherwise produce a "likely cause" that isn't
-    real.
+    (FR-005): same agent identity - but deliberately version/deployment-
+    blind, matching the lineage rule Doctor's own ``previous_run``
+    selection already enforces by construction (see
+    ``agent.checks.regression``). An explicit ``--baseline`` file has no
+    such guarantee built in (the user can point it at any
+    ``results.json``), so ``build_regression_insight`` checks this itself
+    rather than trusting every caller to have already filtered for it -
+    comparing two runs of entirely different agents could otherwise
+    produce a "likely cause" that isn't real.
+
+    Deliberately does *not* require the same ``dataset_path`` or
+    ``evaluators``: those are exactly the kind of change this feature
+    must still be able to attribute a regression to (FR-006, and
+    ``build_changed_inputs``'s own dataset/evaluator-change detection) -
+    blocking on them would make that detection unreachable. ``dataset_path``
+    is also not checkout-stable (local runs persist an absolute, resolved
+    path - see ``services.dataset_source``), so two runs of the very same
+    repo-relative dataset produced from different checkouts (e.g. a
+    committed baseline vs. a fresh CI run) would otherwise never match.
     """
-    if from_run.dataset_path != to_run.dataset_path:
-        return False
-    if sorted(from_run.evaluators) != sorted(to_run.evaluators):
-        return False
     return _agent_identity(from_run.target) == _agent_identity(to_run.target)
 
 

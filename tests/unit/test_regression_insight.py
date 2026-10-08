@@ -168,14 +168,25 @@ def test_no_insight_when_agent_identity_differs():
     assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
 
 
-def test_no_insight_when_dataset_differs():
+def test_dataset_change_is_attributed_not_blocked():
+    """FR-006/build_changed_inputs explicitly attributes a regression to a
+    dataset change - same_lineage must not require an identical
+    dataset_path, both because that's a real, attributable cause this
+    feature exists to surface, and because dataset_path isn't
+    checkout-stable (local runs persist an absolute, resolved path), so a
+    committed baseline from a different checkout than the current CI run
+    would otherwise never match even for the literal same repo-relative
+    dataset."""
     from_run = _run(dataset_path="data/a.jsonl", accuracy=0.91, commit=_commit("a" * 40))
     to_run = _run(dataset_path="data/b.jsonl", accuracy=0.79, commit=_commit("b" * 40))
 
-    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
+
+    assert insight is not None
+    assert any(c.field == "dataset" for c in insight.changed_inputs)
 
 
-def test_no_insight_when_evaluators_differ():
+def test_evaluator_set_change_is_attributed_not_blocked():
     from_run = _run(
         evaluators=["CoherenceEvaluator"], accuracy=0.91, commit=_commit("a" * 40)
     )
@@ -185,7 +196,10 @@ def test_no_insight_when_evaluators_differ():
         commit=_commit("b" * 40),
     )
 
-    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
+
+    assert insight is not None
+    assert any(c.field == "evaluators" for c in insight.changed_inputs)
 
 
 def test_same_lineage_is_version_blind():
@@ -196,6 +210,44 @@ def test_same_lineage_is_version_blind():
     to_run = _run(version="4", deployment="gpt-4o-mini", commit=_commit("b" * 40))
 
     assert regression_insight.same_lineage(from_run, to_run) is True
+
+
+def test_normalize_agent_url_strips_only_the_version_segment():
+    url = "https://acct.services.ai.azure.com/api/projects/p/agents/bot/versions/11"
+    normalized = regression_insight.normalize_agent_url(url)
+
+    assert "/versions/11" not in normalized
+    assert normalized == "https://acct.services.ai.azure.com/api/projects/p/agents/bot"
+
+
+def test_hosted_agent_same_lineage_across_a_version_bump():
+    """A foundry_hosted URL embeds /versions/<version> - using it as-is for
+    agent identity would make every version bump start a new lineage,
+    exactly the change this feature exists to attribute a regression to."""
+    base_url = "https://acct.services.ai.azure.com/api/projects/p/agents/bot/versions"
+    from_run = _run(commit=_commit("a" * 40))
+    from_run.target.kind = "foundry_hosted"
+    from_run.target.url = f"{base_url}/11"
+    to_run = _run(commit=_commit("b" * 40))
+    to_run.target.kind = "foundry_hosted"
+    to_run.target.url = f"{base_url}/12"
+
+    assert regression_insight.same_lineage(from_run, to_run) is True
+
+
+def test_hosted_agent_different_project_is_different_lineage():
+    from_run = _run(commit=_commit("a" * 40))
+    from_run.target.kind = "foundry_hosted"
+    from_run.target.url = (
+        "https://acct.services.ai.azure.com/api/projects/project-a/agents/bot/versions/1"
+    )
+    to_run = _run(commit=_commit("b" * 40))
+    to_run.target.kind = "foundry_hosted"
+    to_run.target.url = (
+        "https://acct.services.ai.azure.com/api/projects/project-b/agents/bot/versions/1"
+    )
+
+    assert regression_insight.same_lineage(from_run, to_run) is False
 
 
 def test_no_insight_when_metric_missing_on_either_run():

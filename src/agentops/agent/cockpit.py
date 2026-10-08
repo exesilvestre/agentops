@@ -40,7 +40,10 @@ from agentops.core.governance import (
 )
 from agentops.core.results import RunResult
 from agentops.pipeline.comparison import LOWER_IS_BETTER_METRICS, metric_improved
-from agentops.pipeline.regression_insight import metric_threshold_criteria
+from agentops.pipeline.regression_insight import (
+    agent_identity_from_fields,
+    metric_threshold_criteria,
+)
 from agentops.pipeline.regression_insight import build_changed_inputs
 from agentops.utils.yaml import load_yaml
 
@@ -926,32 +929,15 @@ def _version_lineage_key(data: Dict[str, Any]) -> Optional[str]:
     """
     raw_target = data.get("target")
     target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
-    # `url` wins over `name` when both are present: for `foundry_hosted`,
-    # `name` is only the agent-name fragment parsed *out of* that same
-    # URL (see TargetInfo's docstring), so two different Foundry projects
-    # with a same-named agent would otherwise collide on an identical,
-    # project-blind `name` and get merged into one lineage - `url` already
-    # carries the full, project-qualified identity. `raw` is the fallback
-    # for every remaining kind except `model_direct` (`model:<deployment>`),
-    # where `raw` itself embeds the deployment (e.g. "model:gpt-4o" vs
-    # "model:gpt-4o-mini") - using it there would make a deployment change
-    # start a new lineage instead of being detected as a change within the
-    # same one. `kind` has no such problem: it's the constant
-    # "model_direct" for every run of this kind.
-    #
-    # Known gap, not fixed here: `foundry_prompt` has neither `url` nor any
-    # other project-qualified field - just `name`/`version` - so two
-    # different projects with a same-named prompt agent still collide.
-    # Fixing that needs a new field capturing the project endpoint on
-    # TargetInfo for prompt agents, which is a bigger, separate change.
-    agent_identity = (
-        target.get("url")
-        or target.get("name")
-        or (
-            target.get("kind")
-            if target.get("kind") == "model_direct"
-            else target.get("raw")
-        )
+    # See `regression_insight.agent_identity_from_fields`'s docstring -
+    # the single source of truth for this, shared with Doctor
+    # (results_history._lineage_key) and build_regression_insight's own
+    # comparability check, so the three can't drift apart again.
+    agent_identity = agent_identity_from_fields(
+        name=target.get("name"),
+        url=target.get("url"),
+        kind=target.get("kind"),
+        raw=target.get("raw"),
     )
     dataset_path = data.get("dataset_path")
     evaluators_raw = data.get("evaluators")
