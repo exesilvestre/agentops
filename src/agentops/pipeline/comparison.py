@@ -122,6 +122,10 @@ def build_comparison(
                 # `current` is still mid-orchestration here (persisted
                 # after this call, Classic Foundry `publish: true` later
                 # still) - only its own in-memory config can be checked.
+                # For `execution: local` + `publish: true`,
+                # orchestrator._publish_to_foundry_safely patches this
+                # value in and re-persists once that later publish step
+                # actually completes, so it isn't permanently `None`.
                 from_report_url=resolve_report_url(baseline, results_path=baseline_path),
                 to_report_url=resolve_report_url(current),
             )

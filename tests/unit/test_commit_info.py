@@ -198,6 +198,36 @@ def test_pull_request_event_falls_back_to_github_sha_when_payload_unusable(
     assert info.source == "ci"
 
 
+def test_pull_request_event_falls_back_to_github_sha_when_head_not_resolvable(
+    tmp_path, monkeypatch
+):
+    """The generated PR workflow's default checkout has no `ref`/
+    `fetch-depth` override, so the real PR head commit object usually
+    isn't present locally - only the merge commit GITHUB_SHA points at
+    is. Using an unresolvable head_sha anyway would make `git show` fail
+    and commit capture return nothing for the whole run (worse than the
+    wrong-but-resolvable GITHUB_SHA attribution this replaces), so it must
+    fall back to GITHUB_SHA instead."""
+    repo = _init_repo(tmp_path)
+    merge_commit_sha = _run(["rev-parse", "HEAD"], cwd=repo)
+    unresolvable_head_sha = "9" * 40  # not a real commit in this repo
+
+    event_path = tmp_path / "event.json"
+    _write_pull_request_event(event_path, head_sha=unresolvable_head_sha)
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_SHA", merge_commit_sha)
+    monkeypatch.delenv("BUILD_SOURCEVERSION", raising=False)
+    monkeypatch.delenv("Build.SourceVersion", raising=False)
+
+    info = commit_info.resolve_commit_info(workspace=repo)
+
+    assert info is not None
+    assert info.sha == merge_commit_sha
+    assert info.source == "ci"
+
+
 def test_non_pull_request_event_still_uses_github_sha_directly(
     tmp_path, monkeypatch
 ):

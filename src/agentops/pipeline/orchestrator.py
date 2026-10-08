@@ -277,7 +277,13 @@ def _run_evaluation_local_snapshot(
     # Local execution only ever publishes to Classic Foundry. Cloud
     # execution goes through _run_evaluation_cloud and never reaches here.
     if config.publish_target() == "foundry":
-        _publish_to_foundry_safely(result, config, options.output_dir, progress=progress)
+        _publish_to_foundry_safely(
+            result,
+            config,
+            options.output_dir,
+            workspace=options.config_path.parent,
+            progress=progress,
+        )
 
     return result
 
@@ -773,9 +779,17 @@ def _publish_to_foundry_safely(
     config: AgentOpsConfig,
     output_dir: Path,
     *,
+    workspace: Path,
     progress: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Best-effort Classic Foundry publish. Failures are logged, never fatal."""
+    """Best-effort Classic Foundry publish. Failures are logged, never fatal.
+
+    On success, also patches ``result.comparison.insight.to_report_url``
+    (left ``None`` by ``_persist``, since this run's own report_url only
+    exists after this publish step completes) and re-persists, so this
+    run's own already-written results.json/report.md don't permanently
+    miss the link to its own Foundry Evaluations page.
+    """
     if config.publish_target() != "foundry":
         return
 
@@ -806,6 +820,18 @@ def _publish_to_foundry_safely(
         ),
         encoding="utf-8",
     )
+
+    # `_persist` already wrote results.json/report.md with
+    # comparison.insight.to_report_url=None, since this publish step (the
+    # only source of this run's own report_url for `publish: true`) runs
+    # after persistence. Patch it in now and re-persist, rather than
+    # leaving the already-published run's own link permanently missing
+    # from its own results.json/report.md.
+    insight = result.comparison.insight if result.comparison is not None else None
+    if insight is not None and insight.to_report_url is None:
+        insight.to_report_url = published.studio_url
+        _persist(result, output_dir, workspace=workspace, commit_resolution_attempted=True)
+
     notify(
         f"Published to {style('Classic Foundry Evaluations', 'bold')}: "
         f"{style(published.studio_url, 'cyan')}"

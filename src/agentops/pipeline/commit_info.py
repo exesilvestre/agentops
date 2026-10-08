@@ -51,10 +51,20 @@ def _pull_request_head_sha() -> Optional[str]:
     return sha or None
 
 
-def _ci_git_sha() -> Optional[str]:
+def _ci_git_sha(*, workspace: Optional[Path] = None) -> Optional[str]:
     if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
         head_sha = _pull_request_head_sha()
-        if head_sha:
+        # The generated PR workflow's default `actions/checkout` has no
+        # `ref`/`fetch-depth` override, so it checks out only the
+        # synthetic merge commit GITHUB_SHA points at - the real PR head
+        # commit object usually isn't present locally at all. Using
+        # head_sha anyway would make the later `git show` fail and commit
+        # capture return nothing for the whole run, which is worse than
+        # today's (wrong but resolvable) GITHUB_SHA attribution. Prefer
+        # head_sha only when it's actually resolvable in this checkout
+        # (e.g. the user customized the workflow to fetch full history or
+        # the head ref); otherwise fall through to GITHUB_SHA below.
+        if head_sha and commit_exists_locally(head_sha, workspace=workspace):
             return head_sha
     for env_var in _CI_SHA_ENV_VARS:
         value = os.environ.get(env_var)
@@ -92,7 +102,7 @@ def resolve_commit_info(*, workspace: Optional[Path] = None) -> Optional[CommitI
     ``None`` - never raises - when neither source yields a resolvable
     commit, e.g. outside a git repository or when ``git`` is unavailable.
     """
-    sha = _ci_git_sha()
+    sha = _ci_git_sha(workspace=workspace)
     source: Literal["ci", "local"] = "ci"
     if not sha:
         sha = _run_git(["rev-parse", "HEAD"], cwd=workspace)
