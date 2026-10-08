@@ -165,16 +165,28 @@ def _lineage_key(data: Dict[str, Any]) -> Optional[str]:
     """
     raw_target = data.get("target")
     target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
-    # `raw` is the identity fallback for every target kind except
-    # `model_direct` (`model:<deployment>`), where `raw` itself embeds the
-    # deployment (e.g. "model:gpt-4o" vs "model:gpt-4o-mini") - using it
-    # there would make a deployment change look like a different agent
-    # entirely, defeating the version/deployment-blind point of this key.
-    # `kind` has no such problem: it's the constant "model_direct" for
-    # every run of this kind.
+    # `url` wins over `name` when both are present: for `foundry_hosted`,
+    # `name` is only the agent-name fragment parsed *out of* that same
+    # URL, so two different Foundry projects with a same-named agent would
+    # otherwise collide on an identical, project-blind `name` and Doctor
+    # could pick a run from the wrong project as the "previous comparable
+    # run" - `url` already carries the full, project-qualified identity.
+    # `raw` is the fallback for every remaining kind except `model_direct`
+    # (`model:<deployment>`), where `raw` itself embeds the deployment
+    # (e.g. "model:gpt-4o" vs "model:gpt-4o-mini") - using it there would
+    # make a deployment change look like a different agent entirely,
+    # defeating the version/deployment-blind point of this key. `kind` has
+    # no such problem: it's the constant "model_direct" for every run of
+    # this kind.
+    #
+    # Known gap, not fixed here: `foundry_prompt` has neither `url` nor
+    # any other project-qualified field - just `name`/`version` - so two
+    # different projects with a same-named prompt agent still collide.
+    # Fixing that needs a new field capturing the project endpoint on
+    # TargetInfo for prompt agents, which is a bigger, separate change.
     agent_identity = (
-        target.get("name")
-        or target.get("url")
+        target.get("url")
+        or target.get("name")
         or (
             target.get("kind")
             if target.get("kind") == "model_direct"
