@@ -76,18 +76,20 @@ untouched.
 
 ## Cockpit projection (not a persisted model — computed per request)
 
-**VersionHistoryEntry** (dict shape returned by `_project_run()` /
-consumed by the cockpit UI):
+**VersionHistoryEntry** (dict shape returned by `_build_eval_history_section()`
+/ consumed by the cockpit UI; see `contracts/report-and-cockpit.md` for the
+full example payload):
 
 | Key | Type | Notes |
 |---|---|---|
 | `run_id` | `str` | Existing field. |
 | `timestamp` | `Optional[str]` | Existing field. |
-| `commit` | `Optional[dict]` | New: `CommitInfo.model_dump()` when known. |
+| `commit_short_sha` / `commit_subject` | `Optional[str]` | New: flattened from `CommitInfo` when known (not a nested `commit` object). |
 | `metrics` | `Dict[str, float]` | Existing field. |
-| `methodology_fingerprint` | `Optional[str]` | New: reused from `results_history._methodology_fingerprint()` so entries can be grouped/ordered per lineage. |
-| `changed_inputs` | `List[dict]` | New: `ChangedInput` list vs. the previous entry sharing the same fingerprint; empty for the first run of a fingerprint. |
+| `changed_inputs` | `List[dict]` | New: `ChangedInput` list vs. the previous entry sharing the same `version_lineage_key` (**not** `methodology_fingerprint` - a deliberately coarser, version/deployment-blind key per FR-005/research.md #3, so a version bump is detected as a change within the same lineage rather than excluded from it); empty for the first run of a lineage. |
 | `regressed` | `bool` | New: whether any metric regressed vs. the previous entry (drives a visual marker; the list itself is not regression-gated per FR-012/User Story 2). |
+| `regressed_metrics` | `List[str]` | New: names every metric that regressed vs. the previous entry, direction-aware (a lower-is-better metric improving is never counted) - not just the boolean. |
+| `cloud_report_url` / `previous_cloud_report_url` | `Optional[str]` | New: this entry's and the previous lineage-comparable entry's Foundry Evaluations link, when published; `None` otherwise. |
 
 ## State / lifecycle notes
 

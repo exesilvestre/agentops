@@ -44,12 +44,33 @@ call-site-specific changes that could drift out of sync.
 
 ## 3. Which prior run to diff against for the causal explanation
 
-**Decision**: Attribute a regression to the single most recent comparable run
-(the immediately preceding entry sharing the same methodology fingerprint —
-same agent target, dataset, evaluator set, per
-`_methodology_fingerprint()` in `src/agentops/agent/sources/results_history.py:145`),
-not the rolling mean that Doctor's existing regression check
-(`src/agentops/agent/checks/regression.py`) uses for its drop-percentage math.
+**Decision**: Attribute a regression to the single most recent comparable
+run — the immediately preceding entry sharing the same *lineage*: same
+dataset, evaluator set, and agent identity, but deliberately
+version/deployment-*blind* (`_lineage_key()` in
+`src/agentops/agent/sources/results_history.py`, and the equivalent
+`_version_lineage_key()` in `src/agentops/agent/cockpit.py`) — not the
+rolling mean that Doctor's existing regression check
+(`src/agentops/agent/checks/regression.py`) uses for its drop-percentage
+math, and not the stricter, version-inclusive `_methodology_fingerprint()`
+either.
+
+Using the strict fingerprint here was the first implementation and is a
+trap worth naming explicitly: it hashes the *whole* target including
+version/deployment, so it treats a version bump as a different
+methodology and excludes the pre-bump run from the comparable set - which
+makes the product owner's own canonical example ("Corrida v3 → v4")
+unreachable, since the v3 run would never be selected as the "most recent
+comparable run" to diff v4 against (there would need to be a prior run
+*already on v4* for the fingerprint-filtered set to be non-empty at all).
+The two keys now coexist for different, non-overlapping purposes: the
+fingerprint still gates the rolling-baseline mean (mixing versions there
+would be genuinely spurious noise) and opex.py's flaky-metric check
+(mixing versions there would inflate variance spuriously); the lineage
+key is used everywhere a single "most recent comparable run" must be
+picked for causal attribution or Cockpit's version-history grouping,
+precisely because a version/deployment change is the attribution this
+feature exists to surface, not a reason to exclude the pair.
 
 **Rationale**: The product owner's own example ("Corrida v3 → v4") compares
 adjacent versions. A rolling mean of several prior runs has no single
@@ -121,16 +142,20 @@ rendered. This is the natural, lowest-effort integration point for User Story
 ## 7. Where Cockpit's history view plugs in
 
 **Decision**: Extend `_project_run()`
-(`src/agentops/agent/cockpit.py:856`) to include the run's `commit` field (if
+(`src/agentops/agent/cockpit.py`) to include the run's `commit` field (if
 present) and a computed `changed_inputs` list versus the previous entry
-sharing the same methodology fingerprint, reusing the same field-diff helper
-from #5. `_load_eval_runs()` (`cockpit.py:827`) already returns an ordered,
-scanned list of runs from `.agentops/results/*/results.json` — the version
-history view is a new rendering of that same list, not a new data source.
+sharing the same *version-blind lineage key* (`_version_lineage_key()`,
+not the stricter `methodology_fingerprint` - see decision #3 above for why
+this view deliberately groups across version bumps instead of excluding
+them), reusing the same field-diff helper from #5. `_load_eval_runs()`
+already returns an ordered, scanned list of runs from
+`.agentops/results/*/results.json` — the version history view is a new
+rendering of that same list, not a new data source.
 
-**Rationale**: This is the same scan Doctor's regression check and
-`results_history.py` already perform; no new persisted index or storage is
-needed once every run carries its own `commit` field.
+**Rationale**: This is the same kind of scan Doctor's regression check and
+`results_history.py` already perform (grouped by their own, separate
+version-blind lineage key - see decision #3); no new persisted index or
+storage is needed once every run carries its own `commit` field.
 
 **Alternatives considered**: A separate persisted history/index file —
 rejected as redundant once per-run files carry everything needed.
