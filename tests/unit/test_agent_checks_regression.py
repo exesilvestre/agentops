@@ -125,15 +125,18 @@ def test_regression_check_skips_when_baseline_too_small() -> None:
     assert findings == []
 
 
-def test_regression_check_ignores_baselines_with_mismatched_methodology() -> None:
-    """Baselines from a different dataset/evaluator set must not count."""
+def test_regression_check_ignores_baselines_with_mismatched_lineage() -> None:
+    """Baselines from a different dataset/evaluator set (lineage) must not
+    count - unlike a version/deployment difference, which must (see
+    ``test_attribution_uses_the_true_immediately_preceding_run_across_a_version_change``
+    below)."""
     history = ResultsHistory(
         runs=[
             # These baselines used a different methodology (e.g. smoke dataset)
             # and must be excluded from the comparison.
-            _run({"coherence": 4.5}, run_id="b1", offset_days=-3, fingerprint="A"),
-            _run({"coherence": 4.5}, run_id="b2", offset_days=-2, fingerprint="A"),
-            _run({"coherence": 3.0}, run_id="latest", offset_days=0, fingerprint="B"),
+            _run({"coherence": 4.5}, run_id="b1", offset_days=-3, lineage_key="A"),
+            _run({"coherence": 4.5}, run_id="b2", offset_days=-2, lineage_key="A"),
+            _run({"coherence": 3.0}, run_id="latest", offset_days=0, lineage_key="B"),
         ]
     )
     config = RegressionCheckConfig(
@@ -143,14 +146,14 @@ def test_regression_check_ignores_baselines_with_mismatched_methodology() -> Non
     assert findings == []
 
 
-def test_regression_check_uses_matching_methodology_baselines() -> None:
-    """Baselines with the same fingerprint as the latest run drive the check."""
+def test_regression_check_uses_matching_lineage_baselines() -> None:
+    """Baselines with the same lineage key as the latest run drive the check."""
     history = ResultsHistory(
         runs=[
-            _run({"coherence": 4.5}, run_id="other", offset_days=-4, fingerprint="A"),
-            _run({"coherence": 4.5}, run_id="b1", offset_days=-3, fingerprint="B"),
-            _run({"coherence": 4.5}, run_id="b2", offset_days=-2, fingerprint="B"),
-            _run({"coherence": 3.0}, run_id="latest", offset_days=0, fingerprint="B"),
+            _run({"coherence": 4.5}, run_id="other", offset_days=-4, lineage_key="A"),
+            _run({"coherence": 4.5}, run_id="b1", offset_days=-3, lineage_key="B"),
+            _run({"coherence": 4.5}, run_id="b2", offset_days=-2, lineage_key="B"),
+            _run({"coherence": 3.0}, run_id="latest", offset_days=0, lineage_key="B"),
         ]
     )
     config = RegressionCheckConfig(
@@ -344,13 +347,8 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
     tmp_path,
 ) -> None:
     """A one-off run on a different version (v5) sits between a v4 run and
-    the latest v4 run. `methodology_fingerprint` (version-inclusive)
-    excludes that v5 run from `baseline_runs`, so picking attribution's
-    comparison partner from `baseline_runs` (the old behavior) would
-    silently skip over it and compare against the older v4 run instead -
-    hiding the fact that something changed in between. Attribution must
-    use the coarser `lineage_key` instead, so it diffs against the run
-    that's actually immediately before `latest`.
+    the latest v4 run. `previous_run` must be v5 - the run actually
+    immediately before `latest` - not the older v4 run two steps back.
     """
     v4_path = tmp_path / "v4" / "results.json"
     v5_path = tmp_path / "v5" / "results.json"
@@ -393,8 +391,6 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
             ),
         ]
     )
-    # min_runs=2 so the fingerprint-gated `baseline_runs` (just the v4 run)
-    # already satisfies `len(baseline_runs) + 1 >= min_runs` on its own.
     config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=2)
 
     findings = run_regression_check(history, config)
@@ -406,3 +402,67 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
     assert insight["from_commit"]["sha"] == "2" * 40
     fields = {c["field"] for c in insight["changed_inputs"]}
     assert "system_prompt" in fields
+
+
+def test_first_run_after_a_version_bump_can_still_be_detected_and_attributed(
+    tmp_path,
+) -> None:
+    """The canonical scenario this whole feature targets: a run regresses
+    right after a version bump, on the very first run of the new version -
+    there is no prior run yet sharing that new version's
+    `methodology_fingerprint`. Gating `baseline_runs` on the fingerprint
+    (version-inclusive) would make this check structurally unable to fire
+    at all here (no baseline shares the brand-new fingerprint); gating on
+    the coarser, version-blind `lineage_key` lets the two older v3 runs
+    serve as the baseline for the fresh v4 regression, exactly as
+    research.md's own "run v3 -> v4" example describes.
+    """
+    v3_a_path = tmp_path / "v3a" / "results.json"
+    v3_b_path = tmp_path / "v3b" / "results.json"
+    v4_path = tmp_path / "v4" / "results.json"
+    _write_result_json(
+        v3_a_path, accuracy=0.90, version="3", deployment="gpt-4o", commit_sha="1" * 40
+    )
+    _write_result_json(
+        v3_b_path, accuracy=0.91, version="3", deployment="gpt-4o", commit_sha="2" * 40
+    )
+    _write_result_json(
+        v4_path, accuracy=0.70, version="4", deployment="gpt-4o-mini", commit_sha="3" * 40
+    )
+
+    history = ResultsHistory(
+        runs=[
+            _run(
+                {"accuracy": 0.90},
+                run_id="v3a",
+                offset_days=-2,
+                lineage_key="L",
+                raw_path=v3_a_path,
+            ),
+            _run(
+                {"accuracy": 0.91},
+                run_id="v3b",
+                offset_days=-1,
+                lineage_key="L",
+                raw_path=v3_b_path,
+            ),
+            _run(
+                {"accuracy": 0.70},
+                run_id="v4",
+                offset_days=0,
+                lineage_key="L",
+                raw_path=v4_path,
+            ),
+        ]
+    )
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=3)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    insight = findings[0].evidence["insight"]
+    # Attributed to the v3 -> v4 change, not silently skipped.
+    assert insight["from_commit"]["sha"] == "2" * 40
+    assert insight["to_commit"]["sha"] == "3" * 40
+    fields = {c["field"] for c in insight["changed_inputs"]}
+    assert fields == {"system_prompt", "model"}

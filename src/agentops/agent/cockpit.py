@@ -83,8 +83,17 @@ def build_cockpit_payload(
     *,
     history: Optional[List[AnalysisRecord]] = None,
     time_range: Optional[TimeRange] = None,
+    run_cache: Optional["_RunCache"] = None,
 ) -> Dict[str, Any]:
-    """Reduce local configuration and the latest Doctor run for the cockpit."""
+    """Reduce local configuration and the latest Doctor run for the cockpit.
+
+    ``run_cache`` (see ``_project_run``) is an explicit, caller-owned dict -
+    passing one lets repeated calls within the same long-lived process
+    (e.g. ``create_app``'s per-server cache) skip re-parsing and
+    re-validating unchanged ``results.json`` files; omitting it (the
+    default) does no caching at all, since a bare module-level cache would
+    be hidden global state the project's architecture explicitly forbids.
+    """
     _ = time_range  # Retained for callers; the cockpit no longer filters by date.
     records = history if history is not None else load_analysis_history(workspace)
     telemetry = _telemetry_status()
@@ -96,7 +105,9 @@ def build_cockpit_payload(
         watchdog_payload, readiness,
         initialized=(workspace / "agentops.yaml").exists(),
     )
-    eval_history = _build_eval_history_section(_load_eval_runs(workspace))
+    eval_history = _build_eval_history_section(
+        _load_eval_runs(workspace, run_cache=run_cache)
+    )
 
     return {
         "workspace": str(workspace.resolve()),
@@ -864,10 +875,13 @@ def _build_eval_history_section(eval_runs: List[Dict[str, Any]]) -> Dict[str, An
     return {"has_runs": True, "entries": entries}
 
 
-def _load_eval_runs(workspace: Path, *, limit: int = 24) -> List[Dict[str, Any]]:
+def _load_eval_runs(
+    workspace: Path, *, limit: int = 24, run_cache: Optional["_RunCache"] = None
+) -> List[Dict[str, Any]]:
     """Scan ``.agentops/results/<timestamp>/results.json`` and project the
     fields the cockpit cares about. ``latest/`` is skipped because it is
-    a mirror of the most recent timestamped run.
+    a mirror of the most recent timestamped run. See ``_project_run`` for
+    ``run_cache``.
     """
     results_root = workspace / ".agentops" / "results"
     if not results_root.exists():
@@ -887,7 +901,7 @@ def _load_eval_runs(workspace: Path, *, limit: int = 24) -> List[Dict[str, Any]]
 
     runs: List[Dict[str, Any]] = []
     for run_id, path in candidates:
-        run = _project_run(path, run_id=run_id)
+        run = _project_run(path, run_id=run_id, run_cache=run_cache)
         if run is not None:
             runs.append(run)
 
@@ -911,7 +925,22 @@ def _version_lineage_key(data: Dict[str, Any]) -> Optional[str]:
     """
     raw_target = data.get("target")
     target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
-    agent_identity = target.get("name") or target.get("url") or target.get("raw")
+    # `raw` is the identity fallback for every target kind except
+    # `model_direct` (`model:<deployment>`), where `raw` itself embeds the
+    # deployment (e.g. "model:gpt-4o" vs "model:gpt-4o-mini") - using it
+    # there would make a deployment change start a new lineage instead of
+    # being detected as a change within the same one, defeating the
+    # version/deployment-blind point of this key. `kind` has no such
+    # problem: it's the constant "model_direct" for every run of this kind.
+    agent_identity = (
+        target.get("name")
+        or target.get("url")
+        or (
+            target.get("kind")
+            if target.get("kind") == "model_direct"
+            else target.get("raw")
+        )
+    )
     dataset_path = data.get("dataset_path")
     evaluators_raw = data.get("evaluators")
     evaluators = (
@@ -994,33 +1023,47 @@ def _attach_version_history(runs: List[Dict[str, Any]]) -> None:
                 )
 
 
-# Keyed by results.json path, holding (mtime, projected dict) - avoids
-# re-reading, re-parsing, and re-validating the same completed run (a
-# `RunResult.model_validate` over every row/metric, not cheap) on every
-# cockpit render. Safe to reuse across renders because a run's
-# `results.json` is written once and never mutated afterwards; `mtime` is
-# still checked so a changed file (e.g. a replayed/overwritten run during
-# development) isn't served stale. Each lookup returns a shallow copy so
-# `_attach_version_history`'s in-place `run[...] = ...` / `run.pop(...)`
-# on the result never corrupts the cached entry.
-_PROJECT_RUN_CACHE: Dict[Path, Tuple[float, Optional[Dict[str, Any]]]] = {}
+# Keyed by results.json path, holding (mtime, projected dict). Deliberately
+# *not* a module-level variable (the architecture constitution and AGENTS.md
+# both prohibit new hidden global state) - callers that want the caching
+# benefit own and pass in their own dict (``create_app`` keeps one per
+# running Cockpit server instance, scoped to its own closure); a caller
+# that passes ``None`` (the default) just gets no caching, not an error.
+_RunCache = Dict[Path, Tuple[float, Optional[Dict[str, Any]]]]
 
 
-def _project_run(path: Path, *, run_id: str) -> Optional[Dict[str, Any]]:
+def _project_run(
+    path: Path, *, run_id: str, run_cache: Optional[_RunCache] = None
+) -> Optional[Dict[str, Any]]:
+    """Project one ``results.json`` into the fields the cockpit cares about.
+
+    ``run_cache`` avoids re-reading, re-parsing, and re-validating the same
+    completed run (a ``RunResult.model_validate`` over every row/metric,
+    not cheap) on every cockpit render. Safe to reuse across renders
+    because a run's ``results.json`` is written once and never mutated
+    afterwards; ``mtime`` is still checked so a changed file (e.g. a
+    replayed/overwritten run during development) isn't served stale. Each
+    lookup returns a shallow copy so ``_attach_version_history``'s
+    in-place ``run[...] = ...`` / ``run.pop(...)`` on the result never
+    corrupts the cached entry.
+    """
+    if run_cache is None:
+        return _project_run_uncached(path, run_id=run_id)
+
     try:
         mtime = path.stat().st_mtime
     except OSError:
         mtime = None
 
     if mtime is not None:
-        cached = _PROJECT_RUN_CACHE.get(path)
+        cached = run_cache.get(path)
         if cached is not None and cached[0] == mtime:
             cached_projection = cached[1]
             return dict(cached_projection) if cached_projection is not None else None
 
     projection = _project_run_uncached(path, run_id=run_id)
     if mtime is not None:
-        _PROJECT_RUN_CACHE[path] = (mtime, dict(projection) if projection is not None else None)
+        run_cache[path] = (mtime, dict(projection) if projection is not None else None)
     return projection
 
 
@@ -5703,12 +5746,16 @@ def create_app(workspace: Path):
         redoc_url=None,
         openapi_url=None,
     )
+    # Explicit, app-instance-scoped (not module-level/global) cache for
+    # `_project_run` - lives exactly as long as this server process. See
+    # `_project_run`'s docstring.
+    run_cache: _RunCache = {}
 
     @app.get("/", response_class=HTMLResponse)
     def _index(partial: Optional[str] = Query(None, alias="_partial")):
         if not partial:
             return HTMLResponse(_render_loading_shell())
-        payload = build_cockpit_payload(workspace)
+        payload = build_cockpit_payload(workspace, run_cache=run_cache)
         return HTMLResponse(render_cockpit_html(payload))
 
     @app.get("/favicon.ico")
@@ -5728,7 +5775,7 @@ def create_app(workspace: Path):
 
     @app.get("/api/eval-runs")
     def _api_eval_runs(limit: int = 24):
-        return JSONResponse(_load_eval_runs(workspace, limit=limit))
+        return JSONResponse(_load_eval_runs(workspace, limit=limit, run_cache=run_cache))
 
     @app.get("/api/runs/{run_id}/report", response_class=HTMLResponse)
     def _api_run_report(run_id: str):

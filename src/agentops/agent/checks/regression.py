@@ -37,7 +37,7 @@ def _load_run_result(summary: RunSummary) -> Optional[RunResult]:
 
 def _attribution_unavailable_reason(
     latest: RunSummary,
-    previous_run: Optional[RunSummary],
+    previous_run: RunSummary,
     latest_result: Optional[RunResult],
     previous_result: Optional[RunResult],
 ) -> str:
@@ -51,8 +51,6 @@ def _attribution_unavailable_reason(
     ``agentops eval run`` (including ``execution: cloud``/``azd``), which
     always attempts commit capture.
     """
-    if previous_run is None:
-        return "attribution unavailable: no comparable prior run found"
     non_local = [
         run
         for run, result in ((latest, latest_result), (previous_run, previous_result))
@@ -81,39 +79,34 @@ def run_regression_check(
         return []
 
     latest = runs[-1]
-    # Only compare against runs that share the same evaluation methodology
-    # (same agent target, dataset, and evaluator set). This avoids spurious
-    # regressions when the dataset, evaluators, or runner changes between
-    # runs (e.g. smoke → hardened conversation rubric, or local → cloud).
-    fingerprint = latest.methodology_fingerprint
-    if fingerprint is None:
+    # Only compare against runs that share the same dataset, evaluators,
+    # and agent identity - but deliberately version/deployment-*blind*
+    # (`lineage_key`, not the finer `methodology_fingerprint` opex.py's
+    # flaky-metric check needs, which does want version included since
+    # mixing versions there would inflate variance spuriously). A version
+    # bump is exactly the kind of change this check - and its causal
+    # attribution - exists to catch, not an incompatible methodology to
+    # exclude: keying this on the fingerprint instead would make the
+    # check structurally unable to fire on the first run(s) after a
+    # version bump (there being no baseline yet sharing that new,
+    # not-yet-established fingerprint), making the feature's own
+    # canonical "run v3 -> v4" scenario unreachable.
+    lineage_key = latest.lineage_key
+    if lineage_key is None:
         baseline_runs = runs[:-1]
     else:
-        baseline_runs = [
-            r for r in runs[:-1] if r.methodology_fingerprint == fingerprint
-        ]
+        baseline_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
     if len(baseline_runs) + 1 < config.min_runs:
         return []
     if not baseline_runs:
         return []
 
     # The immediately preceding comparable run, for causal attribution -
-    # distinct from `baseline_runs` above (used for the rolling drop%
-    # mean). Deliberately keyed on the coarser `lineage_key` (dataset,
-    # evaluators, agent identity - version/deployment excluded) rather than
-    # `baseline_runs`/`methodology_fingerprint`: a version bump changes the
-    # fingerprint, so using `baseline_runs` here would always filter out
-    # the very run (the old version) this feature's canonical scenario -
-    # attributing a regression to a version bump - needs to diff against.
-    lineage_key = latest.lineage_key
-    if lineage_key is None:
-        lineage_runs = runs[:-1]
-    else:
-        lineage_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
-    previous_run = lineage_runs[-1] if lineage_runs else None
-
+    # distinct from the rolling drop% mean below, which uses every
+    # comparable run, not just the last one.
+    previous_run = baseline_runs[-1]
     latest_result = _load_run_result(latest)
-    previous_result = _load_run_result(previous_run) if previous_run is not None else None
+    previous_result = _load_run_result(previous_run)
 
     findings: List[Finding] = []
     for metric in config.metrics:

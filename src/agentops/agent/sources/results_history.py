@@ -165,10 +165,21 @@ def _lineage_key(data: Dict[str, Any]) -> Optional[str]:
     """
     raw_target = data.get("target")
     target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
+    # `raw` is the identity fallback for every target kind except
+    # `model_direct` (`model:<deployment>`), where `raw` itself embeds the
+    # deployment (e.g. "model:gpt-4o" vs "model:gpt-4o-mini") - using it
+    # there would make a deployment change look like a different agent
+    # entirely, defeating the version/deployment-blind point of this key.
+    # `kind` has no such problem: it's the constant "model_direct" for
+    # every run of this kind.
     agent_identity = (
         target.get("name")
         or target.get("url")
-        or target.get("raw")
+        or (
+            target.get("kind")
+            if target.get("kind") == "model_direct"
+            else target.get("raw")
+        )
         or (data.get("config") or {}).get("agent")
     )
     dataset_path = data.get("dataset_path") or (data.get("config") or {}).get(

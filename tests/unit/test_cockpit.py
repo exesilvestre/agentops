@@ -1934,6 +1934,92 @@ def test_version_history_names_changes_vs_previous_run(tmp_path: Path):
     assert second["regressed"] is True
 
 
+def _write_direct_model_eval_run(
+    workspace: Path,
+    *,
+    timestamp_dir: str,
+    deployment: str,
+    accuracy: float,
+    commit_sha: str,
+    started_at: str,
+) -> None:
+    """A ``model:<deployment>`` target has no ``name``/``url`` - only
+    ``raw`` (which embeds the deployment itself, e.g. ``"model:gpt-4o"``)
+    and ``deployment``."""
+    out = workspace / ".agentops" / "results" / timestamp_dir
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "started_at": started_at,
+        "finished_at": started_at,
+        "duration_seconds": 1.0,
+        "target": {
+            "kind": "model_direct",
+            "raw": f"model:{deployment}",
+            "deployment": deployment,
+        },
+        "dataset_path": "data/smoke.jsonl",
+        "evaluators": ["CoherenceEvaluator"],
+        "rows": [],
+        "aggregate_metrics": {"accuracy": accuracy},
+        "thresholds": [],
+        "summary": {
+            "items_total": 1,
+            "items_passed_all": 1,
+            "items_pass_rate": 1.0,
+            "thresholds_total": 0,
+            "thresholds_passed": 0,
+            "threshold_pass_rate": 1.0,
+            "overall_passed": True,
+        },
+        "config": {},
+        "commit": {
+            "sha": commit_sha,
+            "short_sha": commit_sha[:7],
+            "subject": "A commit",
+            "author": "Dev",
+            "authored_at": started_at,
+            "source": "ci",
+        },
+    }
+    (out / "results.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_version_lineage_key_ignores_deployment_for_direct_model_targets(
+    tmp_path: Path,
+):
+    """``raw`` embeds the deployment for `model:<deployment>` targets
+    (unlike `name`/`url` for every other target kind) - falling back to it
+    for the version-lineage identity would make a deployment change start
+    a brand new lineage instead of being detected as a change within the
+    same one, defeating the entire point of this view."""
+    _write_direct_model_eval_run(
+        tmp_path,
+        timestamp_dir="2026-09-01T10-00-00Z",
+        deployment="gpt-4o",
+        accuracy=0.91,
+        commit_sha="a" * 40,
+        started_at="2026-09-01T10:00:00+00:00",
+    )
+    _write_direct_model_eval_run(
+        tmp_path,
+        timestamp_dir="2026-09-10T14-03-00Z",
+        deployment="gpt-4o-mini",
+        accuracy=0.79,
+        commit_sha="b" * 40,
+        started_at="2026-09-10T14:03:00+00:00",
+    )
+
+    runs = _load_eval_runs(tmp_path)
+
+    assert len(runs) == 2
+    first, second = runs
+    assert first["version_lineage_key"] == second["version_lineage_key"]
+    fields = {c["field"] for c in second["changed_inputs"]}
+    assert fields == {"model"}
+    assert second["regressed"] is True
+
+
 def test_version_history_latency_improvement_is_not_flagged_as_regressed(
     tmp_path: Path,
 ):
@@ -2098,8 +2184,9 @@ def test_project_run_is_cached_by_path_and_mtime(tmp_path: Path, monkeypatch):
     """Re-rendering the cockpit without any new run must not re-parse and
     re-validate (``RunResult.model_validate``) the same unchanged
     ``results.json`` files again - that cost is paid once per file, not
-    once per render."""
-    cockpit_module._PROJECT_RUN_CACHE.clear()
+    once per render, as long as the caller passes the same explicit
+    ``run_cache`` dict both times (there is no implicit/global cache)."""
+    run_cache: dict = {}
     _write_full_eval_run(
         tmp_path,
         timestamp_dir="2026-09-01T10-00-00Z",
@@ -2117,16 +2204,17 @@ def test_project_run_is_cached_by_path_and_mtime(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(cockpit_module, "_project_run_uncached", _counting_uncached)
 
-    first = _load_eval_runs(tmp_path)
-    second = _load_eval_runs(tmp_path)
+    first = _load_eval_runs(tmp_path, run_cache=run_cache)
+    second = _load_eval_runs(tmp_path, run_cache=run_cache)
 
     assert calls["count"] == 1
     assert first[0]["run_id"] == second[0]["run_id"]
     assert first[0]["commit"] == second[0]["commit"]
 
 
-def test_project_run_cache_invalidated_on_file_change(tmp_path: Path, monkeypatch):
-    cockpit_module._PROJECT_RUN_CACHE.clear()
+def test_project_run_without_cache_reparses_every_call(tmp_path: Path, monkeypatch):
+    """The default (``run_cache=None``) does no caching at all - a caller
+    that never opts in never gets stale data, by construction."""
     _write_full_eval_run(
         tmp_path,
         timestamp_dir="2026-09-01T10-00-00Z",
@@ -2135,7 +2223,32 @@ def test_project_run_cache_invalidated_on_file_change(tmp_path: Path, monkeypatc
         started_at="2026-09-01T10:00:00+00:00",
     )
 
-    first = _load_eval_runs(tmp_path)
+    calls = {"count": 0}
+    original = cockpit_module._project_run_uncached
+
+    def _counting_uncached(path, *, run_id):
+        calls["count"] += 1
+        return original(path, run_id=run_id)
+
+    monkeypatch.setattr(cockpit_module, "_project_run_uncached", _counting_uncached)
+
+    _load_eval_runs(tmp_path)
+    _load_eval_runs(tmp_path)
+
+    assert calls["count"] == 2
+
+
+def test_project_run_cache_invalidated_on_file_change(tmp_path: Path, monkeypatch):
+    run_cache: dict = {}
+    _write_full_eval_run(
+        tmp_path,
+        timestamp_dir="2026-09-01T10-00-00Z",
+        accuracy=0.91,
+        commit_sha="a" * 40,
+        started_at="2026-09-01T10:00:00+00:00",
+    )
+
+    first = _load_eval_runs(tmp_path, run_cache=run_cache)
     assert first[0]["metrics"]["accuracy"] == 0.91
 
     results_path = tmp_path / ".agentops" / "results" / "2026-09-01T10-00-00Z" / "results.json"
@@ -2147,7 +2260,7 @@ def test_project_run_cache_invalidated_on_file_change(tmp_path: Path, monkeypatc
     new_mtime = results_path.stat().st_mtime + 1
     os.utime(results_path, (new_mtime, new_mtime))
 
-    second = _load_eval_runs(tmp_path)
+    second = _load_eval_runs(tmp_path, run_cache=run_cache)
     assert second[0]["metrics"]["accuracy"] == 0.42
 
 
