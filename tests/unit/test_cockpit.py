@@ -2294,6 +2294,31 @@ def test_cockpit_html_renders_version_history_section(tmp_path: Path):
     assert "regressed" in html
 
 
+def test_version_history_tolerates_non_numeric_metric_value(tmp_path: Path):
+    """`_project_run_uncached` keeps projecting a run even when full
+    `RunResult` validation fails, so a malformed/historical results.json
+    can carry a non-numeric metric value - rendering must skip it rather
+    than raise and take down the whole page."""
+    _write_full_eval_run(
+        tmp_path,
+        timestamp_dir="2026-09-01T10-00-00Z",
+        accuracy=0.91,
+        commit_sha="a" * 40,
+        started_at="2026-09-01T10:00:00+00:00",
+    )
+    results_path = tmp_path / ".agentops" / "results" / "2026-09-01T10-00-00Z" / "results.json"
+    payload = json.loads(results_path.read_text(encoding="utf-8"))
+    payload["aggregate_metrics"]["coherence"] = "n/a"
+    results_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cockpit_payload = build_cockpit_payload(tmp_path)
+    html = render_cockpit_html(cockpit_payload)  # must not raise
+
+    assert "Evaluation Version History" in html
+    assert "accuracy=0.910" in html
+    assert "coherence=" not in html
+
+
 def test_cockpit_html_version_history_empty_state(tmp_path: Path):
     payload = build_cockpit_payload(tmp_path)
     html = render_cockpit_html(payload)

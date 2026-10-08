@@ -4433,10 +4433,17 @@ def _render_eval_history_section(eval_history: Dict[str, Any]) -> str:
             commit_html = '<span class="muted">unknown commit</span>'
 
         metrics = entry.get("metrics") or {}
-        metrics_html = ", ".join(
-            f"{_html_escape(str(name))}={value:.3f}"
-            for name, value in sorted(metrics.items())
-        ) or "&mdash;"
+        # `_project_run_uncached` keeps projecting a run even when full
+        # `RunResult` validation fails, so a malformed/historical
+        # `results.json` can carry a non-numeric metric value here -
+        # formatting it with `:.3f` directly would raise and take down
+        # the whole Cockpit page for every entry, not just this one.
+        metric_parts: List[str] = []
+        for name, value in sorted(metrics.items()):
+            numeric_value = _safe_float(value)
+            if numeric_value is not None:
+                metric_parts.append(f"{_html_escape(str(name))}={numeric_value:.3f}")
+        metrics_html = ", ".join(metric_parts) or "&mdash;"
 
         changes = entry.get("changed_inputs") or []
         if changes:
