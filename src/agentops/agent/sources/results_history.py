@@ -38,10 +38,22 @@ class RunSummary:
     portal_url: Optional[str] = None
     methodology_fingerprint: Optional[str] = None
     # Coarser than `methodology_fingerprint` - same agent identity, dataset,
-    # and evaluator set, but version/deployment excluded. See
-    # `_lineage_key`'s docstring for why `agent.checks.regression` needs
-    # this separate, coarser key for causal attribution.
+    # and evaluator set, but version/deployment excluded. Used for
+    # Cockpit-style display grouping (same grouping concept as
+    # `cockpit._version_lineage_key`) - *not* for picking `previous_run` in
+    # `agent.checks.regression` (see `agent_identity_key` below for that).
     lineage_key: Optional[str] = None
+    # Narrower still than `lineage_key`: agent identity alone, dataset and
+    # evaluators excluded. `agent.checks.regression` needs this - not
+    # `lineage_key` - to pick "the immediately preceding run with the same
+    # agent" for causal attribution, consistent with
+    # `regression_insight.same_lineage`'s own, equally agent-identity-only
+    # rule: a dataset/evaluator-set change is itself one of the things this
+    # feature must be able to attribute a regression to, so filtering the
+    # candidate pool by them first would make picking the *actual*
+    # immediately-preceding run (and thus detecting that very change)
+    # impossible whenever an intervening run used a different dataset.
+    agent_identity_key: Optional[str] = None
 
 
 @dataclass
@@ -146,39 +158,44 @@ def _summarize(path: Path) -> Optional[RunSummary]:
         item_evaluations=item_evaluations,
         methodology_fingerprint=_methodology_fingerprint(data),
         lineage_key=_lineage_key(data),
+        agent_identity_key=_agent_identity_key(data),
     )
+
+
+def _agent_identity_key(data: Dict[str, Any]) -> Optional[str]:
+    """The run's agent identity alone (see
+    ``regression_insight.agent_identity_from_fields`` - the single source
+    of truth for this, shared with Cockpit (``cockpit._version_lineage_key``)
+    and ``build_regression_insight``'s own comparability check), with no
+    dataset/evaluator information folded in. Feeds ``RunSummary
+    .agent_identity_key`` - see that field's docstring for why
+    ``agent.checks.regression`` needs exactly this, narrower than
+    ``_lineage_key`` below, to pick the comparison partner for causal
+    attribution.
+    """
+    raw_target = data.get("target")
+    target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
+    identity = agent_identity_from_fields(
+        name=target.get("name"),
+        url=target.get("url"),
+        kind=target.get("kind"),
+        raw=target.get("raw"),
+    ) or (data.get("config") or {}).get("agent")
+    return str(identity) if identity else None
 
 
 def _lineage_key(data: Dict[str, Any]) -> Optional[str]:
     """Derive a stable hash of (agent identity, dataset, evaluators) -
     deliberately excluding the agent's version/deployment, unlike
-    ``_methodology_fingerprint`` below.
-
-    ``agent.checks.regression`` needs this coarser key to pick "the
-    immediately preceding comparable run" for causal regression
-    attribution. Using ``_methodology_fingerprint`` for that (as it
-    correctly does for its own drop%-mean baseline, where mixing
-    methodologies would be spurious) would make the feature's own
-    canonical scenario - attributing a regression to a version bump,
-    e.g. "run v3 -> v4" - unreachable: a version bump changes the
-    fingerprint, so the prior (different-version) run would always be
-    filtered out before it could be picked as the comparison partner.
+    ``_methodology_fingerprint`` below. This is the *display* grouping key
+    (same concept as ``cockpit._version_lineage_key``) - for picking the
+    comparison partner for causal regression attribution,
+    ``agent.checks.regression`` uses the narrower ``_agent_identity_key``
+    above instead (see its docstring and ``RunSummary.agent_identity_key``
+    for why: a dataset/evaluator change must itself remain attributable,
+    which filtering the candidate pool by them first would prevent).
     """
-    raw_target = data.get("target")
-    target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
-    # See `regression_insight.agent_identity_from_fields`'s docstring - the
-    # single source of truth for this, shared with Cockpit
-    # (cockpit._version_lineage_key) and build_regression_insight's own
-    # comparability check, so the three can't drift apart again.
-    agent_identity = (
-        agent_identity_from_fields(
-            name=target.get("name"),
-            url=target.get("url"),
-            kind=target.get("kind"),
-            raw=target.get("raw"),
-        )
-        or (data.get("config") or {}).get("agent")
-    )
+    agent_identity = _agent_identity_key(data)
     dataset_path = data.get("dataset_path") or (data.get("config") or {}).get(
         "dataset"
     )

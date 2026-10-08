@@ -187,6 +187,27 @@ def test_custom_lower_is_better_metric_drop_is_improved_not_regressed():
     assert info.insight is None
 
 
+def test_boolean_false_threshold_metric_drop_is_improved():
+    """A `thresholds: { has_error: false }` metric (values 0/1) passes
+    when it's 0 - moving from 1 to 0 is an improvement, same direction as
+    a `<=` threshold, not the higher-is-better default."""
+    baseline = _with_threshold(
+        _run(accuracy=0.91, commit=_commit("a" * 40)), metric="has_error", criteria="false"
+    )
+    baseline.aggregate_metrics["has_error"] = 1.0
+    current = _with_threshold(
+        _run(accuracy=0.91, commit=_commit("b" * 40)), metric="has_error", criteria="false"
+    )
+    current.aggregate_metrics["has_error"] = 0.0
+
+    info = comparison.build_comparison(
+        current=current, baseline=baseline, baseline_path=Path(".agentops/baseline/results.json")
+    )
+
+    has_error_metric = next(m for m in info.metrics if m.metric == "has_error")
+    assert has_error_metric.direction == "improved"
+
+
 def test_insight_carries_baseline_report_url_from_sidecar_file(tmp_path: Path):
     """``baseline`` is a prior, fully-published run - a sidecar
     ``cloud_evaluation.json`` next to its ``results.json`` (as a completed

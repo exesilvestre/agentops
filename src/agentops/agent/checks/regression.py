@@ -107,21 +107,26 @@ def run_regression_check(
 
     # The immediately preceding comparable run, for causal attribution -
     # distinct from `baseline_runs` above (detection's rolling drop% mean,
-    # left untouched). Deliberately keyed on the coarser `lineage_key`
-    # (dataset, evaluators, agent identity - version/deployment excluded)
-    # rather than `baseline_runs`/`methodology_fingerprint`: when a
-    # regression *has* been detected and happens to coincide with a
-    # version bump, the fingerprint would exclude the pre-bump run from
-    # `baseline_runs`, so picking the comparison partner from there could
-    # silently skip over it and attribute the cause to an older, less
-    # relevant run instead. This only changes which run an *already-fired*
-    # finding is explained against, never whether one fires.
-    lineage_key = latest.lineage_key
-    if lineage_key is None:
-        lineage_runs = runs[:-1]
+    # left untouched). Deliberately keyed on `agent_identity_key` alone
+    # (not `lineage_key`, which also requires the same dataset/evaluators,
+    # and not `baseline_runs`/`methodology_fingerprint`, which also
+    # requires the same version): a dataset, evaluator-set, *or*
+    # version/deployment change must each remain attributable
+    # (`same_lineage` in `pipeline.regression_insight` enforces the same,
+    # agent-identity-only rule) - filtering the candidate pool by any of
+    # those first would make picking the run that actually changed (and
+    # thus detecting that very change) impossible whenever an intervening
+    # run differed only in dataset, evaluators, or version. This only
+    # changes which run an *already-fired* finding is explained against,
+    # never whether one fires.
+    agent_identity_key = latest.agent_identity_key
+    if agent_identity_key is None:
+        identity_runs = runs[:-1]
     else:
-        lineage_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
-    previous_run = lineage_runs[-1] if lineage_runs else None
+        identity_runs = [
+            r for r in runs[:-1] if r.agent_identity_key == agent_identity_key
+        ]
+    previous_run = identity_runs[-1] if identity_runs else None
 
     latest_result = _load_run_result(latest)
     previous_result = _load_run_result(previous_run) if previous_run is not None else None

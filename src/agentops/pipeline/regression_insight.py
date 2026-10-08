@@ -86,13 +86,26 @@ def metric_threshold_criteria(
 def _is_lower_is_better(metric: str, *, criteria: Optional[str] = None) -> bool:
     """Whether a lower value is the better outcome for ``metric``.
 
-    ``criteria`` (a recorded threshold operator like ``"<="``, from
+    ``criteria`` (a recorded threshold operator, from
     ``metric_threshold_criteria``) wins when given - it reflects what this
     specific metric was actually configured to mean, unlike
     ``LOWER_IS_BETTER_METRICS``, which is only a fallback guess for the one
     built-in metric known to commonly be lower-is-better.
+
+    A boolean threshold (``"false"``/``"true"``, for a metric whose values
+    are 0/1) is treated the same as ``<=``/``>=``: passing means 0
+    (``"false"``), so lower is better, same as it would be for a
+    continuous metric thresholded that way. An equality threshold
+    (``"=="``) has no well-defined "lower is better" at all - what's
+    "closer to passing" depends on the recorded target value, not raw
+    magnitude - so it's deliberately left unhandled here and falls through
+    to the same default as no criteria at all, rather than guessing.
     """
     if criteria is not None:
+        if criteria == "false":
+            return True
+        if criteria == "true":
+            return False
         if criteria.startswith("<"):
             return True
         if criteria.startswith(">"):

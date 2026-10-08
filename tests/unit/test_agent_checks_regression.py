@@ -18,6 +18,7 @@ def _run(
     offset_days: int = 0,
     fingerprint: str | None = None,
     lineage_key: str | None = None,
+    agent_identity_key: str | None = None,
     raw_path: Path | None = None,
     source: str = "local",
 ) -> RunSummary:
@@ -31,6 +32,7 @@ def _run(
         raw_path=raw_path or Path("dummy"),
         methodology_fingerprint=fingerprint,
         lineage_key=lineage_key,
+        agent_identity_key=agent_identity_key,
         source=source,
     )
 
@@ -42,6 +44,7 @@ def _write_result_json(
     version: str,
     deployment: str,
     commit_sha: str,
+    dataset_path: str = "data/smoke.jsonl",
 ) -> None:
     payload = {
         "version": 1,
@@ -55,7 +58,7 @@ def _write_result_json(
             "version": version,
             "deployment": deployment,
         },
-        "dataset_path": "data/smoke.jsonl",
+        "dataset_path": dataset_path,
         "evaluators": ["CoherenceEvaluator"],
         "rows": [],
         "aggregate_metrics": {"accuracy": accuracy},
@@ -374,6 +377,7 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
                 offset_days=-2,
                 fingerprint="V4",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=v4_path,
             ),
             _run(
@@ -382,6 +386,7 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
                 offset_days=-1,
                 fingerprint="V5",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=v5_path,
             ),
             _run(
@@ -390,6 +395,7 @@ def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_ch
                 offset_days=0,
                 fingerprint="V4",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=latest_path,
             ),
         ]
@@ -466,6 +472,7 @@ def test_no_insight_when_the_selected_pair_did_not_itself_regress(tmp_path) -> N
                 offset_days=-2,
                 fingerprint="V4",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=v4_path,
             ),
             _run(
@@ -474,6 +481,7 @@ def test_no_insight_when_the_selected_pair_did_not_itself_regress(tmp_path) -> N
                 offset_days=-1,
                 fingerprint="V5",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=v5_path,
             ),
             _run(
@@ -482,6 +490,7 @@ def test_no_insight_when_the_selected_pair_did_not_itself_regress(tmp_path) -> N
                 offset_days=0,
                 fingerprint="V4",
                 lineage_key="L",
+                agent_identity_key="L",
                 raw_path=latest_path,
             ),
         ]
@@ -499,3 +508,80 @@ def test_no_insight_when_the_selected_pair_did_not_itself_regress(tmp_path) -> N
         "baseline instead"
     )
     assert "didn't show this drop" in finding.recommendation
+
+
+def test_attribution_picks_the_immediately_preceding_run_across_a_dataset_change(
+    tmp_path,
+) -> None:
+    """Older runs used dataset B, one intervening run used dataset A, then
+    the latest (regressed) run is back on dataset B. Filtering candidates
+    by `lineage_key` (which also requires the same dataset) would skip the
+    dataset-A run and miss that the dataset changed in between -
+    `agent_identity_key` (agent identity only) must pick it instead.
+    """
+    b1_path = tmp_path / "b1" / "results.json"
+    a_path = tmp_path / "a" / "results.json"
+    latest_path = tmp_path / "latest" / "results.json"
+    _write_result_json(
+        b1_path,
+        accuracy=0.90,
+        version="4",
+        deployment="gpt-4o",
+        commit_sha="1" * 40,
+        dataset_path="data/dataset-b.jsonl",
+    )
+    _write_result_json(
+        a_path,
+        accuracy=0.92,
+        version="4",
+        deployment="gpt-4o",
+        commit_sha="2" * 40,
+        dataset_path="data/dataset-a.jsonl",
+    )
+    _write_result_json(
+        latest_path,
+        accuracy=0.70,
+        version="4",
+        deployment="gpt-4o",
+        commit_sha="3" * 40,
+        dataset_path="data/dataset-b.jsonl",
+    )
+
+    history = ResultsHistory(
+        runs=[
+            _run(
+                {"accuracy": 0.90},
+                run_id="b1",
+                offset_days=-2,
+                fingerprint="B",
+                agent_identity_key="agent",
+                raw_path=b1_path,
+            ),
+            _run(
+                {"accuracy": 0.92},
+                run_id="a",
+                offset_days=-1,
+                fingerprint="A",
+                agent_identity_key="agent",
+                raw_path=a_path,
+            ),
+            _run(
+                {"accuracy": 0.70},
+                run_id="latest",
+                offset_days=0,
+                fingerprint="B",
+                agent_identity_key="agent",
+                raw_path=latest_path,
+            ),
+        ]
+    )
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=2)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    insight = findings[0].evidence["insight"]
+    # The dataset-A run's commit, not the older dataset-B run's.
+    assert insight["from_commit"]["sha"] == "2" * 40
+    fields = {c["field"] for c in insight["changed_inputs"]}
+    assert "dataset" in fields

@@ -725,19 +725,32 @@ Foundry prompt-agent deploy gating), and on a best-effort basis locally via
 `git rev-parse HEAD`. It's `null` when the workspace isn't a git repository
 or `git` is unavailable; nothing else about the run changes.
 
-When one or more metrics regress between two comparable runs (same agent
-target, dataset, and evaluator set) that both have commit metadata -
-whether detected via an explicit `--baseline` comparison or Doctor's
-rolling regression check - `report.md` gains a "Regression Insight" section
-listing every metric that regressed (not just the worst one) and explaining
-what changed between the two commits (system prompt, model, dataset,
-evaluators, or thresholds) and suggesting a corrective action. When either
-run was published to Foundry (`execution: cloud`, or local `publish: true`),
-the section also links out to its Evaluations page. This is deterministic
-field-diffing, not an LLM call, and it's purely informational: it never
-affects the exit-code/threshold-gating contract. Runs without commit
-metadata, or where nothing tracked changed, behave exactly as they did
-before this existed.
+When one or more metrics regress between two runs of the same agent
+identity (deliberately independent of version/model/deployment - a change
+there is itself one of the things attributed) that both have commit
+metadata, a dataset or evaluator-set change between them is attributable
+too, same as a prompt/model change: the system never requires an
+identical dataset/evaluator set to explain a regression, only that it's
+the same agent.
+
+For an explicit `--baseline` comparison, this explanation is a
+"Regression Insight" section appended to `report.md`, listing every
+metric that regressed (not just the worst one) and explaining what
+changed between the two commits (system prompt, model, dataset,
+evaluators, or thresholds) with a suggested corrective action. When
+either run was published to Foundry (`execution: cloud`, or local
+`publish: true`), the section also links out to its Evaluations page.
+Doctor's rolling regression check surfaces the same explanation
+differently: not in `report.md` at all, but in the triggering `Finding`'s
+own `recommendation` text (and `evidence["insight"]`) - Doctor's own
+rolling-baseline *detection* additionally stays on the stricter,
+version-inclusive methodology fingerprint unchanged by any of this (see
+`agent.checks.regression`), so a version bump alone doesn't affect
+*whether* Doctor flags a regression, only how the already-flagged one
+gets explained. This is deterministic field-diffing, not an LLM call, and
+it's purely informational: it never affects the exit-code/threshold-gating
+contract. Runs without commit metadata, or where nothing tracked changed,
+behave exactly as they did before this existed.
 
 Every run produced by `agentops eval run` - including `execution: cloud`
 and `execution: azd` - attempts commit capture. The one case with no commit
