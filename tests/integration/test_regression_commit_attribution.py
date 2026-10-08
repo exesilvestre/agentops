@@ -11,6 +11,7 @@ env vars, commit resolved via local git).
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -218,3 +219,69 @@ def test_regression_commit_attribution_purely_local(
     assert current_result.comparison.insight is not None
     report_text = (current_dir / "report.md").read_text(encoding="utf-8")
     assert "## Regression Insight" in report_text
+
+
+def _run_git(args: list[str], *, cwd: Path) -> str:
+    completed = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=True
+    )
+    return completed.stdout.strip()
+
+
+def test_commit_is_captured_before_execution_not_after(
+    tmp_path: Path, monkeypatch, good_and_bad_servers
+) -> None:
+    """A local run's commit must reflect the repo's HEAD when the run
+    *started*, not whatever HEAD happens to be once execution (the
+    row-by-row agent/evaluator loop, which can take a while) finishes - a
+    commit made to the repo mid-run must not retroactively change which
+    commit this run is attributed to.
+    """
+    good_url, _bad_url = good_and_bad_servers
+    for env_var in ("GITHUB_SHA", "BUILD_SOURCEVERSION", "Build.SourceVersion"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    repo = tmp_path
+    _run_git(["init"], cwd=repo)
+    _run_git(["config", "user.email", "dev@example.com"], cwd=repo)
+    _run_git(["config", "user.name", "Dev"], cwd=repo)
+    (repo / "README.md").write_text("before\n", encoding="utf-8")
+    _run_git(["add", "README.md"], cwd=repo)
+    _run_git(["commit", "-m", "Commit present when the run starts"], cwd=repo)
+    sha_at_start = _run_git(["rev-parse", "HEAD"], cwd=repo)
+
+    dataset_path = repo / "dataset.jsonl"
+    _write_dataset(dataset_path)
+    config_path = repo / "agentops.yaml"
+    _write_config(config_path, agent_url=good_url, dataset=dataset_path)
+    config = load_agentops_config(config_path)
+
+    original_evaluate_row = orchestrator._evaluate_row
+
+    def _evaluate_row_then_commit_mid_run(**kwargs):
+        row_result = original_evaluate_row(**kwargs)
+        if kwargs.get("index") == 0:
+            # Simulate the developer committing/checking out something
+            # else while this (slow, real-world) run is still executing.
+            (repo / "README.md").write_text("after\n", encoding="utf-8")
+            _run_git(["commit", "-am", "Made while the run was executing"], cwd=repo)
+        return row_result
+
+    monkeypatch.setattr(
+        orchestrator, "_evaluate_row", _evaluate_row_then_commit_mid_run
+    )
+
+    result = run_evaluation(
+        config,
+        options=RunOptions(
+            config_path=config_path,
+            output_dir=tmp_path / "out",
+            timeout_seconds=10.0,
+        ),
+    )
+
+    sha_after_run = _run_git(["rev-parse", "HEAD"], cwd=repo)
+    assert sha_after_run != sha_at_start  # the mid-run commit really happened
+    assert result.commit is not None
+    assert result.commit.sha == sha_at_start
+    assert result.commit.sha != sha_after_run

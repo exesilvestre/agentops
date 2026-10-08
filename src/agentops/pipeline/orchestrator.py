@@ -32,6 +32,7 @@ from agentops.core.evaluators import (
     select_evaluators,
 )
 from agentops.core.results import (
+    CommitInfo,
     RowMetric,
     RowResult,
     RunResult,
@@ -150,6 +151,11 @@ def _run_evaluation_local_snapshot(
 
     started_at = datetime.now(timezone.utc)
     started_perf = time.perf_counter()
+    # Captured now, before the (potentially long-running) row-by-row loop
+    # below, not after it finishes - otherwise a commit or checkout made
+    # locally while this run is still executing would attribute the
+    # result to code that was never actually evaluated.
+    commit = resolve_commit_info(workspace=options.config_path.parent)
 
     target = classify_agent(
         options.agent_override or config.agent,
@@ -265,7 +271,7 @@ def _run_evaluation_local_snapshot(
         },
     )
 
-    _finalize_commit_and_comparison(result, options)
+    _finalize_commit_and_comparison(result, options, commit=commit)
 
     _persist(
         result,
@@ -322,6 +328,10 @@ def _run_evaluation_cloud_snapshot(
     """
     started_at = datetime.now(timezone.utc)
     started_perf = time.perf_counter()
+    # Captured now, before Foundry's (potentially long-running) server-side
+    # run below, not after it completes - see the matching comment in
+    # _run_evaluation_local_snapshot.
+    commit = resolve_commit_info(workspace=options.config_path.parent)
 
     target = classify_agent(
         options.agent_override or config.agent,
@@ -555,7 +565,7 @@ def _run_evaluation_cloud_snapshot(
         },
     )
 
-    _finalize_commit_and_comparison(result, options)
+    _finalize_commit_and_comparison(result, options, commit=commit)
 
     _persist(
         result,
@@ -607,6 +617,10 @@ def _run_evaluation_azd(
     started_at = datetime.now(timezone.utc)
     progress = options.progress or (lambda _msg: None)
     workspace = options.config_path.parent
+    # Captured now, before azd's (potentially long-running) subprocess
+    # below, not after it finishes - see the matching comment in
+    # _run_evaluation_local_snapshot.
+    commit = resolve_commit_info(workspace=workspace)
 
     target = classify_agent(
         options.agent_override or config.agent,
@@ -642,6 +656,7 @@ def _run_evaluation_azd(
             resolution=resolution,
             workspace=workspace,
             started_at=started_at,
+            commit=commit,
             recipe_display=_display(resolution.path),
         )
     return _run_evaluation_azd_legacy(
@@ -650,6 +665,7 @@ def _run_evaluation_azd(
         recipe_path=resolution.path,
         workspace=workspace,
         started_at=started_at,
+        commit=commit,
         recipe_display=_display(resolution.path),
     )
 
@@ -661,6 +677,7 @@ def _run_evaluation_azd_legacy(
     recipe_path: Path,
     workspace: Path,
     started_at: datetime,
+    commit: Optional[CommitInfo] = None,
     recipe_display: str,
 ) -> RunResult:
     """Legacy surface: ``azd ai agent eval`` via the original adapter."""
@@ -689,7 +706,7 @@ def _run_evaluation_azd_legacy(
         started_at=started_at,
     )
 
-    _finalize_commit_and_comparison(result, options)
+    _finalize_commit_and_comparison(result, options, commit=commit)
 
     _persist(
         result,
@@ -708,6 +725,7 @@ def _run_evaluation_azd_current(
     resolution: Any,
     workspace: Path,
     started_at: datetime,
+    commit: Optional[CommitInfo] = None,
     recipe_display: str,
 ) -> RunResult:
     """Current surface: ``azd ai eval`` via the current-surface adapter."""
@@ -762,7 +780,7 @@ def _run_evaluation_azd_current(
         resolution=resolution,
     )
 
-    _finalize_commit_and_comparison(result, options)
+    _finalize_commit_and_comparison(result, options, commit=commit)
 
     _persist(
         result,
@@ -1163,7 +1181,12 @@ def _summarize(
 # ---------------------------------------------------------------------------
 
 
-def _finalize_commit_and_comparison(result: RunResult, options: RunOptions) -> None:
+def _finalize_commit_and_comparison(
+    result: RunResult,
+    options: RunOptions,
+    *,
+    commit: Optional[CommitInfo] = None,
+) -> None:
     """Attach commit metadata, then build the ``--baseline`` comparison.
 
     Commit metadata must be resolved before the comparison is built so a
@@ -1171,10 +1194,20 @@ def _finalize_commit_and_comparison(result: RunResult, options: RunOptions) -> N
     ``pipeline.regression_insight.build_regression_insight``); resolving it
     only at persist time (after the comparison already ran) would always
     leave ``current.commit`` unset for this call.
+
+    ``commit``, when given, is a value every current call site captures
+    *before* dispatching the (potentially long-running) evaluation/azd
+    subprocess/Foundry run - not resolving it here, after execution has
+    already finished, avoids attributing the result to whatever the repo's
+    HEAD happens to be by the time execution completes (which, for a local
+    run that takes minutes, is not guaranteed to still be the commit that
+    was actually evaluated). Falling back to resolving it now - the
+    previous behavior - stays as a safety net for a caller that doesn't
+    pre-capture it.
     """
     workspace = options.config_path.parent
     if result.commit is None:
-        result.commit = resolve_commit_info(workspace=workspace)
+        result.commit = commit if commit is not None else resolve_commit_info(workspace=workspace)
     if options.baseline_path is not None:
         baseline = comparison_module.load_baseline(options.baseline_path)
         result.comparison = comparison_module.build_comparison(
