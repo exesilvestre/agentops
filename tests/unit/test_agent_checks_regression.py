@@ -432,3 +432,70 @@ def test_first_run_after_a_version_bump_is_a_known_accepted_gap_in_doctor() -> N
     findings = run_regression_check(history, config)
 
     assert findings == []
+
+
+def test_no_insight_when_the_selected_pair_did_not_itself_regress(tmp_path) -> None:
+    """`previous_run` is selected independently of `baseline_runs` (by
+    lineage, not fingerprint), so a metric can regress against the
+    rolling baseline while actually *improving* between that specific
+    pair: v4=0.90, then a one-off v5 excursion at 0.50, then v4=0.70 again
+    - the rolling mean (0.90) vs 0.70 is a real ~22% drop that must still
+    fire, but the immediately preceding run (v5, 0.50) to latest (0.70) is
+    an *increase*, not a drop. Building an insight from that pair would
+    describe an improvement as the regression's cause - it must be
+    skipped, with a clear reason, instead.
+    """
+    v4_path = tmp_path / "v4" / "results.json"
+    v5_path = tmp_path / "v5" / "results.json"
+    latest_path = tmp_path / "latest" / "results.json"
+    _write_result_json(
+        v4_path, accuracy=0.90, version="4", deployment="gpt-4o", commit_sha="1" * 40
+    )
+    _write_result_json(
+        v5_path, accuracy=0.50, version="5", deployment="gpt-4o", commit_sha="2" * 40
+    )
+    _write_result_json(
+        latest_path, accuracy=0.70, version="4", deployment="gpt-4o", commit_sha="3" * 40
+    )
+
+    history = ResultsHistory(
+        runs=[
+            _run(
+                {"accuracy": 0.90},
+                run_id="v4",
+                offset_days=-2,
+                fingerprint="V4",
+                lineage_key="L",
+                raw_path=v4_path,
+            ),
+            _run(
+                {"accuracy": 0.50},
+                run_id="v5",
+                offset_days=-1,
+                fingerprint="V5",
+                lineage_key="L",
+                raw_path=v5_path,
+            ),
+            _run(
+                {"accuracy": 0.70},
+                run_id="latest",
+                offset_days=0,
+                fingerprint="V4",
+                lineage_key="L",
+                raw_path=latest_path,
+            ),
+        ]
+    )
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=2)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert "insight" not in finding.evidence
+    assert finding.evidence["attribution_unavailable"] == (
+        "attribution unavailable: the immediately preceding comparable "
+        "run didn't show this drop - likely driven by the broader rolling "
+        "baseline instead"
+    )
+    assert "didn't show this drop" in finding.recommendation

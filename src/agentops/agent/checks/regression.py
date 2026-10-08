@@ -11,7 +11,11 @@ from agentops.agent.config import RegressionCheckConfig
 from agentops.agent.findings import Category, Finding, Severity
 from agentops.agent.sources.results_history import ResultsHistory, RunSummary
 from agentops.core.results import RegressionInsight, RunResult
-from agentops.pipeline.regression_insight import build_regression_insight, resolve_report_url
+from agentops.pipeline.regression_insight import (
+    build_regression_insight,
+    metric_improved,
+    resolve_report_url,
+)
 
 
 def _load_run_result(summary: RunSummary) -> Optional[RunResult]:
@@ -162,31 +166,53 @@ def run_regression_check(
         }
 
         insight: Optional[RegressionInsight] = None
+        reason: Optional[str] = None
         if latest_result is not None and previous_result is not None:
-            insight = build_regression_insight(
-                previous_result,
-                latest_result,
-                metrics=[metric],
-                workspace=workspace,
-                # Both are already-completed historical runs, so a sidecar
-                # `cloud_evaluation.json` next to either (from
-                # `execution: cloud` or a finished `publish: true`) is
-                # complete by now - unlike the in-flight `--baseline`
-                # comparison in `pipeline.comparison`.
-                from_report_url=resolve_report_url(
-                    previous_result, results_path=previous_run.raw_path
-                ),
-                to_report_url=resolve_report_url(latest_result, results_path=latest.raw_path),
-            )
+            # `previous_run` is selected independently of `baseline_runs`
+            # (by lineage, not fingerprint - see above), so the metric can
+            # have regressed against the rolling baseline while actually
+            # *improving* between this specific pair (e.g. a one-off
+            # excursion run sits between them with an unrelated, much
+            # lower value). Building an insight from a pair that doesn't
+            # itself show the drop would describe an improvement as the
+            # regression's cause - skip it and say so instead of
+            # fabricating a misleading explanation.
+            previous_value = previous_result.aggregate_metrics.get(metric)
+            latest_value = latest_result.aggregate_metrics.get(metric)
+            if metric_improved(metric, latest_value, previous_value) is False:
+                insight = build_regression_insight(
+                    previous_result,
+                    latest_result,
+                    metrics=[metric],
+                    workspace=workspace,
+                    # Both are already-completed historical runs, so a sidecar
+                    # `cloud_evaluation.json` next to either (from
+                    # `execution: cloud` or a finished `publish: true`) is
+                    # complete by now - unlike the in-flight `--baseline`
+                    # comparison in `pipeline.comparison`.
+                    from_report_url=resolve_report_url(
+                        previous_result, results_path=previous_run.raw_path
+                    ),
+                    to_report_url=resolve_report_url(
+                        latest_result, results_path=latest.raw_path
+                    ),
+                )
+            else:
+                reason = (
+                    "attribution unavailable: the immediately preceding "
+                    "comparable run didn't show this drop - likely driven "
+                    "by the broader rolling baseline instead"
+                )
         if insight is not None:
             evidence["insight"] = insight.model_dump(mode="json")
             recommendation = insight.explanation
             if insight.suggested_action:
                 recommendation = f"{recommendation} {insight.suggested_action}"
         else:
-            reason = _attribution_unavailable_reason(
-                latest, previous_run, latest_result, previous_result
-            )
+            if reason is None:
+                reason = _attribution_unavailable_reason(
+                    latest, previous_run, latest_result, previous_result
+                )
             evidence["attribution_unavailable"] = reason
             recommendation = f"{recommendation} ({reason})"
 
