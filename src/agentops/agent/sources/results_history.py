@@ -36,6 +36,11 @@ class RunSummary:
     source: str = "local"
     portal_url: Optional[str] = None
     methodology_fingerprint: Optional[str] = None
+    # Coarser than `methodology_fingerprint` - same agent identity, dataset,
+    # and evaluator set, but version/deployment excluded. See
+    # `_lineage_key`'s docstring for why `agent.checks.regression` needs
+    # this separate, coarser key for causal attribution.
+    lineage_key: Optional[str] = None
 
 
 @dataclass
@@ -139,7 +144,56 @@ def _summarize(path: Path) -> Optional[RunSummary]:
         raw_path=path,
         item_evaluations=item_evaluations,
         methodology_fingerprint=_methodology_fingerprint(data),
+        lineage_key=_lineage_key(data),
     )
+
+
+def _lineage_key(data: Dict[str, Any]) -> Optional[str]:
+    """Derive a stable hash of (agent identity, dataset, evaluators) -
+    deliberately excluding the agent's version/deployment, unlike
+    ``_methodology_fingerprint`` below.
+
+    ``agent.checks.regression`` needs this coarser key to pick "the
+    immediately preceding comparable run" for causal regression
+    attribution. Using ``_methodology_fingerprint`` for that (as it
+    correctly does for its own drop%-mean baseline, where mixing
+    methodologies would be spurious) would make the feature's own
+    canonical scenario - attributing a regression to a version bump,
+    e.g. "run v3 -> v4" - unreachable: a version bump changes the
+    fingerprint, so the prior (different-version) run would always be
+    filtered out before it could be picked as the comparison partner.
+    """
+    raw_target = data.get("target")
+    target: Dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
+    agent_identity = (
+        target.get("name")
+        or target.get("url")
+        or target.get("raw")
+        or (data.get("config") or {}).get("agent")
+    )
+    dataset_path = data.get("dataset_path") or (data.get("config") or {}).get(
+        "dataset"
+    )
+    evaluators_raw = data.get("evaluators")
+    if isinstance(evaluators_raw, list):
+        evaluators = sorted(str(e) for e in evaluators_raw)
+    elif isinstance(evaluators_raw, dict):
+        evaluators = sorted(str(k) for k in evaluators_raw.keys())
+    else:
+        evaluators = []
+
+    if not agent_identity and not dataset_path and not evaluators:
+        return None
+
+    payload = json.dumps(
+        {
+            "agent_identity": str(agent_identity) if agent_identity else None,
+            "dataset": str(dataset_path) if dataset_path else None,
+            "evaluators": evaluators,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _methodology_fingerprint(data: Dict[str, Any]) -> Optional[str]:

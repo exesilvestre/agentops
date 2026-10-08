@@ -17,6 +17,7 @@ def _run(
     run_id: str = "r",
     offset_days: int = 0,
     fingerprint: str | None = None,
+    lineage_key: str | None = None,
     raw_path: Path | None = None,
     source: str = "local",
 ) -> RunSummary:
@@ -29,6 +30,7 @@ def _run(
         items_passed_all=1,
         raw_path=raw_path or Path("dummy"),
         methodology_fingerprint=fingerprint,
+        lineage_key=lineage_key,
         source=source,
     )
 
@@ -182,9 +184,44 @@ def test_regression_check_attaches_insight_when_both_runs_have_commit_metadata(t
     assert len(findings) == 1
     finding = findings[0]
     assert "insight" in finding.evidence
-    assert finding.evidence["insight"]["metric"] == "accuracy"
+    assert finding.evidence["insight"]["regressed_metrics"][0]["metric"] == "accuracy"
     assert "gpt-4o" in finding.recommendation and "gpt-4o-mini" in finding.recommendation
     assert "prompt" in finding.recommendation
+
+
+def test_regression_check_insight_carries_report_url_when_published_present_and_absent(
+    tmp_path,
+) -> None:
+    """The baseline run was published (sidecar ``cloud_evaluation.json``
+    next to its ``results.json``); the latest run was not - the insight
+    must carry the former's URL and omit the latter's, rather than
+    fabricating or erroring on the missing side."""
+    baseline_path = tmp_path / "baseline" / "results.json"
+    latest_path = tmp_path / "latest" / "results.json"
+    _write_result_json(
+        baseline_path, accuracy=0.91, version="3", deployment="gpt-4o", commit_sha="a" * 40
+    )
+    (baseline_path.parent / "cloud_evaluation.json").write_text(
+        '{"report_url": "https://ai.azure.com/foundry/baseline"}', encoding="utf-8"
+    )
+    _write_result_json(
+        latest_path, accuracy=0.79, version="4", deployment="gpt-4o-mini", commit_sha="b" * 40
+    )
+    history = ResultsHistory(
+        runs=[
+            _run({"accuracy": 0.91}, run_id="b1", offset_days=-3, raw_path=baseline_path),
+            _run({"accuracy": 0.91}, run_id="b2", offset_days=-2, raw_path=baseline_path),
+            _run({"accuracy": 0.79}, run_id="latest", offset_days=0, raw_path=latest_path),
+        ]
+    )
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=3)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    insight = findings[0].evidence["insight"]
+    assert insight["from_report_url"] == "https://ai.azure.com/foundry/baseline"
+    assert insight["to_report_url"] is None
 
 
 def test_regression_check_keeps_generic_recommendation_without_commit_metadata() -> None:
@@ -205,7 +242,9 @@ def test_regression_check_keeps_generic_recommendation_without_commit_metadata()
     assert "inspect prompt/model/dataset changes" in findings[0].recommendation
 
 
-def test_regression_check_skips_insight_for_cloud_sourced_runs(tmp_path) -> None:
+def test_regression_check_explains_why_attribution_is_unavailable_for_cloud_sourced_runs(
+    tmp_path,
+) -> None:
     baseline_path = tmp_path / "baseline" / "results.json"
     latest_path = tmp_path / "latest" / "results.json"
     _write_result_json(
@@ -245,3 +284,125 @@ def test_regression_check_skips_insight_for_cloud_sourced_runs(tmp_path) -> None
 
     assert len(findings) == 1
     assert "insight" not in findings[0].evidence
+    assert findings[0].evidence["attribution_unavailable"] == (
+        "attribution unavailable: run has no commit (fetched from cloud)"
+    )
+    assert "attribution unavailable: run has no commit (fetched from cloud)" in (
+        findings[0].recommendation
+    )
+
+
+def test_regression_check_explains_unavailable_attribution_for_mixed_local_and_cloud_runs(
+    tmp_path,
+) -> None:
+    """A local baseline compared against a cloud-fetched current run (the
+    asymmetric case Doctor's history merge can produce) - no commit is
+    available on the cloud side, so attribution is unavailable, and the
+    finding must say why rather than silently falling back to the generic
+    recommendation."""
+    baseline_path = tmp_path / "baseline" / "results.json"
+    _write_result_json(
+        baseline_path, accuracy=0.91, version="3", deployment="gpt-4o", commit_sha="a" * 40
+    )
+    history = ResultsHistory(
+        runs=[
+            _run(
+                {"accuracy": 0.91},
+                run_id="b1",
+                offset_days=-3,
+                raw_path=baseline_path,
+                source="local",
+            ),
+            _run(
+                {"accuracy": 0.91},
+                run_id="b2",
+                offset_days=-2,
+                raw_path=baseline_path,
+                source="local",
+            ),
+            _run(
+                {"accuracy": 0.79},
+                run_id="latest",
+                offset_days=0,
+                raw_path=Path("foundry") / "eval123" / "run456",
+                source="foundry_cloud",
+            ),
+        ]
+    )
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=3)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    assert "insight" not in findings[0].evidence
+    assert findings[0].evidence["attribution_unavailable"] == (
+        "attribution unavailable: run has no commit (fetched from cloud)"
+    )
+
+
+def test_attribution_uses_the_true_immediately_preceding_run_across_a_version_change(
+    tmp_path,
+) -> None:
+    """A one-off run on a different version (v5) sits between a v4 run and
+    the latest v4 run. `methodology_fingerprint` (version-inclusive)
+    excludes that v5 run from `baseline_runs`, so picking attribution's
+    comparison partner from `baseline_runs` (the old behavior) would
+    silently skip over it and compare against the older v4 run instead -
+    hiding the fact that something changed in between. Attribution must
+    use the coarser `lineage_key` instead, so it diffs against the run
+    that's actually immediately before `latest`.
+    """
+    v4_path = tmp_path / "v4" / "results.json"
+    v5_path = tmp_path / "v5" / "results.json"
+    latest_path = tmp_path / "latest" / "results.json"
+    _write_result_json(
+        v4_path, accuracy=0.90, version="4", deployment="gpt-4o", commit_sha="1" * 40
+    )
+    _write_result_json(
+        v5_path, accuracy=0.95, version="5", deployment="gpt-4o", commit_sha="2" * 40
+    )
+    _write_result_json(
+        latest_path, accuracy=0.70, version="4", deployment="gpt-4o", commit_sha="3" * 40
+    )
+
+    history = ResultsHistory(
+        runs=[
+            _run(
+                {"accuracy": 0.90},
+                run_id="v4",
+                offset_days=-2,
+                fingerprint="V4",
+                lineage_key="L",
+                raw_path=v4_path,
+            ),
+            _run(
+                {"accuracy": 0.95},
+                run_id="v5",
+                offset_days=-1,
+                fingerprint="V5",
+                lineage_key="L",
+                raw_path=v5_path,
+            ),
+            _run(
+                {"accuracy": 0.70},
+                run_id="latest",
+                offset_days=0,
+                fingerprint="V4",
+                lineage_key="L",
+                raw_path=latest_path,
+            ),
+        ]
+    )
+    # min_runs=2 so the fingerprint-gated `baseline_runs` (just the v4 run)
+    # already satisfies `len(baseline_runs) + 1 >= min_runs` on its own.
+    config = RegressionCheckConfig(metrics=["accuracy"], threshold_drop=0.10, min_runs=2)
+
+    findings = run_regression_check(history, config)
+
+    assert len(findings) == 1
+    insight = findings[0].evidence["insight"]
+    # The v5 run's commit, not the older v4 run's - confirms attribution
+    # diffed against the true immediately-preceding run.
+    assert insight["from_commit"]["sha"] == "2" * 40
+    fields = {c["field"] for c in insight["changed_inputs"]}
+    assert "system_prompt" in fields

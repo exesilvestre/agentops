@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from statistics import mean
 from typing import List, Optional
 
@@ -10,7 +11,7 @@ from agentops.agent.config import RegressionCheckConfig
 from agentops.agent.findings import Category, Finding, Severity
 from agentops.agent.sources.results_history import ResultsHistory, RunSummary
 from agentops.core.results import RegressionInsight, RunResult
-from agentops.pipeline.regression_insight import build_regression_insight
+from agentops.pipeline.regression_insight import build_regression_insight, resolve_report_url
 
 
 def _load_run_result(summary: RunSummary) -> Optional[RunResult]:
@@ -34,8 +35,46 @@ def _load_run_result(summary: RunSummary) -> Optional[RunResult]:
         return None
 
 
+def _attribution_unavailable_reason(
+    latest: RunSummary,
+    previous_run: Optional[RunSummary],
+    latest_result: Optional[RunResult],
+    previous_result: Optional[RunResult],
+) -> str:
+    """Why ``build_regression_insight`` was skipped or returned ``None``.
+
+    Surfaced instead of silently falling back to the generic
+    recommendation, since a cloud-fetched run (Doctor's fallback to
+    Foundry evaluation runs when local history is too short - see
+    ``results_history._merge_runs``) has no local ``results.json`` to
+    reload and therefore no recorded commit, unlike every run produced by
+    ``agentops eval run`` (including ``execution: cloud``/``azd``), which
+    always attempts commit capture.
+    """
+    if previous_run is None:
+        return "attribution unavailable: no comparable prior run found"
+    non_local = [
+        run
+        for run, result in ((latest, latest_result), (previous_run, previous_result))
+        if result is None and run.source != "local"
+    ]
+    if non_local:
+        return "attribution unavailable: run has no commit (fetched from cloud)"
+    if latest_result is None or previous_result is None:
+        return "attribution unavailable: the run's results.json could not be read"
+    if latest_result.commit is None or previous_result.commit is None:
+        return "attribution unavailable: run has no recorded commit"
+    return (
+        "attribution unavailable: the regressed metric's value is missing "
+        "on one of the compared runs"
+    )
+
+
 def run_regression_check(
-    history: ResultsHistory, config: RegressionCheckConfig
+    history: ResultsHistory,
+    config: RegressionCheckConfig,
+    *,
+    workspace: Optional[Path] = None,
 ) -> List[Finding]:
     runs = history.runs
     if len(runs) < config.min_runs:
@@ -58,12 +97,23 @@ def run_regression_check(
     if not baseline_runs:
         return []
 
-    # The immediately preceding comparable run - the natural "what changed
-    # since last time" pair, distinct from the rolling mean used for the
-    # drop-percentage math below.
-    previous_run = baseline_runs[-1]
+    # The immediately preceding comparable run, for causal attribution -
+    # distinct from `baseline_runs` above (used for the rolling drop%
+    # mean). Deliberately keyed on the coarser `lineage_key` (dataset,
+    # evaluators, agent identity - version/deployment excluded) rather than
+    # `baseline_runs`/`methodology_fingerprint`: a version bump changes the
+    # fingerprint, so using `baseline_runs` here would always filter out
+    # the very run (the old version) this feature's canonical scenario -
+    # attributing a regression to a version bump - needs to diff against.
+    lineage_key = latest.lineage_key
+    if lineage_key is None:
+        lineage_runs = runs[:-1]
+    else:
+        lineage_runs = [r for r in runs[:-1] if r.lineage_key == lineage_key]
+    previous_run = lineage_runs[-1] if lineage_runs else None
+
     latest_result = _load_run_result(latest)
-    previous_result = _load_run_result(previous_run)
+    previous_result = _load_run_result(previous_run) if previous_run is not None else None
 
     findings: List[Finding] = []
     for metric in config.metrics:
@@ -107,12 +157,32 @@ def run_regression_check(
 
         insight: Optional[RegressionInsight] = None
         if latest_result is not None and previous_result is not None:
-            insight = build_regression_insight(previous_result, latest_result, metric=metric)
+            insight = build_regression_insight(
+                previous_result,
+                latest_result,
+                metrics=[metric],
+                workspace=workspace,
+                # Both are already-completed historical runs, so a sidecar
+                # `cloud_evaluation.json` next to either (from
+                # `execution: cloud` or a finished `publish: true`) is
+                # complete by now - unlike the in-flight `--baseline`
+                # comparison in `pipeline.comparison`.
+                from_report_url=resolve_report_url(
+                    previous_result, results_path=previous_run.raw_path
+                ),
+                to_report_url=resolve_report_url(latest_result, results_path=latest.raw_path),
+            )
         if insight is not None:
             evidence["insight"] = insight.model_dump(mode="json")
             recommendation = insight.explanation
             if insight.suggested_action:
                 recommendation = f"{recommendation} {insight.suggested_action}"
+        else:
+            reason = _attribution_unavailable_reason(
+                latest, previous_run, latest_result, previous_result
+            )
+            evidence["attribution_unavailable"] = reason
+            recommendation = f"{recommendation} ({reason})"
 
         findings.append(
             Finding(
