@@ -128,7 +128,9 @@ def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, good_url: str, bad
     _write_dataset(current_dataset)
 
     commits = iter([_fake_commit("a" * 40), _fake_commit("b" * 40)])
-    monkeypatch.setattr(orchestrator, "resolve_commit_info", lambda: next(commits))
+    monkeypatch.setattr(
+        orchestrator, "resolve_commit_info", lambda **kwargs: next(commits)
+    )
 
     baseline_config_path = tmp_path / "agentops-baseline.yaml"
     _write_config(baseline_config_path, agent_url=good_url, dataset=baseline_dataset)
@@ -180,8 +182,9 @@ def test_regression_commit_attribution_end_to_end(
     assert current_result.comparison.insight is not None
 
     insight = current_result.comparison.insight
-    assert insight.metric == "f1_score"
-    assert insight.from_value == pytest.approx(1.0)
+    assert len(insight.regressed_metrics) == 1
+    assert insight.regressed_metrics[0].metric == "f1_score"
+    assert insight.regressed_metrics[0].from_value == pytest.approx(1.0)
     assert any(c.field == "dataset" for c in insight.changed_inputs)
 
     report_text = (current_dir / "report.md").read_text(encoding="utf-8")

@@ -725,21 +725,35 @@ Foundry prompt-agent deploy gating), and on a best-effort basis locally via
 `git rev-parse HEAD`. It's `null` when the workspace isn't a git repository
 or `git` is unavailable; nothing else about the run changes.
 
-When a metric regresses between two comparable runs (same agent target,
-dataset, and evaluator set) that both have commit metadata - whether
-detected via an explicit `--baseline` comparison or Doctor's rolling
-regression check - `report.md` gains a "Regression Insight" section
-explaining what changed between the two commits (system prompt, model,
-dataset, evaluators, or thresholds) and suggesting a corrective action. This
-is deterministic field-diffing, not an LLM call, and it's purely
-informational: it never affects the exit-code/threshold-gating contract.
-Runs without commit metadata, or where nothing tracked changed, behave
-exactly as they did before this existed.
+When one or more metrics regress between two comparable runs (same agent
+target, dataset, and evaluator set) that both have commit metadata -
+whether detected via an explicit `--baseline` comparison or Doctor's
+rolling regression check - `report.md` gains a "Regression Insight" section
+listing every metric that regressed (not just the worst one) and explaining
+what changed between the two commits (system prompt, model, dataset,
+evaluators, or thresholds) and suggesting a corrective action. When either
+run was published to Foundry (`execution: cloud`, or local `publish: true`),
+the section also links out to its Evaluations page. This is deterministic
+field-diffing, not an LLM call, and it's purely informational: it never
+affects the exit-code/threshold-gating contract. Runs without commit
+metadata, or where nothing tracked changed, behave exactly as they did
+before this existed.
+
+Every run produced by `agentops eval run` - including `execution: cloud`
+and `execution: azd` - attempts commit capture. The one case with no commit
+to attribute is Doctor's rolling regression check when it falls back to
+Foundry cloud evaluation runs because local history is too short (see
+`results_history`'s cloud fallback): those runs have no local
+`results.json` to reload and therefore no recorded commit. When that
+happens, the regression finding's recommendation says so explicitly (e.g.
+`attribution unavailable: run has no commit (fetched from cloud)`) instead
+of silently omitting the insight.
 
 Cockpit's dashboard also gains an "Evaluation Version History" section
-listing every locally recorded run, newest first, with its commit and what
-changed relative to the previous run in its lineage - shown regardless of
-whether that run regressed, so you can browse the causal trail over time.
+listing every locally recorded run, newest first, with its commit, which
+metrics (if any) regressed relative to the previous run in its lineage by
+name, and what changed - shown regardless of whether that run regressed, so
+you can browse the causal trail over time.
 
 ## Testing
 

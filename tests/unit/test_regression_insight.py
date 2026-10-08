@@ -26,8 +26,16 @@ def _run(
     evaluators: list[str] | None = None,
     thresholds: dict | None = None,
     accuracy: float = 0.9,
+    metrics: dict[str, float] | None = None,
     commit: CommitInfo | None = None,
+    cloud_evaluation: dict | None = None,
 ) -> RunResult:
+    aggregate_metrics = {"accuracy": accuracy}
+    if metrics is not None:
+        aggregate_metrics.update(metrics)
+    config: dict = {"thresholds": thresholds or {}}
+    if cloud_evaluation is not None:
+        config["cloud_evaluation"] = cloud_evaluation
     return RunResult(
         started_at="2026-09-01T10:00:00+00:00",
         finished_at="2026-09-01T10:00:01+00:00",
@@ -41,7 +49,7 @@ def _run(
         ),
         dataset_path=dataset_path,
         evaluators=evaluators or ["CoherenceEvaluator"],
-        aggregate_metrics={"accuracy": accuracy},
+        aggregate_metrics=aggregate_metrics,
         summary=RunSummary(
             items_total=1,
             items_passed_all=1,
@@ -51,7 +59,7 @@ def _run(
             threshold_pass_rate=1.0,
             overall_passed=True,
         ),
-        config={"thresholds": thresholds or {}},
+        config=config,
         commit=commit,
     )
 
@@ -138,14 +146,14 @@ def test_no_insight_when_from_commit_missing():
     from_run = _run(accuracy=0.91, commit=None)
     to_run = _run(accuracy=0.79, commit=_commit("b" * 40))
 
-    assert regression_insight.build_regression_insight(from_run, to_run, metric="accuracy") is None
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
 
 
 def test_no_insight_when_to_commit_missing():
     from_run = _run(accuracy=0.91, commit=_commit("a" * 40))
     to_run = _run(accuracy=0.79, commit=None)
 
-    assert regression_insight.build_regression_insight(from_run, to_run, metric="accuracy") is None
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
 
 
 def test_no_insight_when_metric_missing_on_either_run():
@@ -153,7 +161,7 @@ def test_no_insight_when_metric_missing_on_either_run():
     to_run = _run(commit=_commit("b" * 40))
     to_run.aggregate_metrics = {}
 
-    assert regression_insight.build_regression_insight(from_run, to_run, metric="accuracy") is None
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
 
 
 def test_insight_names_metric_before_after_and_changed_inputs():
@@ -170,12 +178,13 @@ def test_insight_names_metric_before_after_and_changed_inputs():
         commit=_commit("b" * 40, short_sha="bbbbbbb"),
     )
 
-    insight = regression_insight.build_regression_insight(from_run, to_run, metric="accuracy")
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
 
     assert insight is not None
-    assert insight.metric == "accuracy"
-    assert insight.from_value == 0.91
-    assert insight.to_value == 0.79
+    assert len(insight.regressed_metrics) == 1
+    assert insight.regressed_metrics[0].metric == "accuracy"
+    assert insight.regressed_metrics[0].from_value == 0.91
+    assert insight.regressed_metrics[0].to_value == 0.79
     assert "0.91" in insight.explanation
     assert "0.79" in insight.explanation
     assert "aaaaaaa" in insight.explanation
@@ -190,7 +199,7 @@ def test_insight_explanation_has_no_cause_when_nothing_tracked_changed():
     from_run = _run(accuracy=0.91, commit=_commit("a" * 40, short_sha="aaaaaaa"))
     to_run = _run(accuracy=0.79, commit=_commit("b" * 40, short_sha="bbbbbbb"))
 
-    insight = regression_insight.build_regression_insight(from_run, to_run, metric="accuracy")
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
 
     assert insight is not None
     assert insight.changed_inputs == []
@@ -198,23 +207,170 @@ def test_insight_explanation_has_no_cause_when_nothing_tracked_changed():
     assert insight.suggested_action is None
 
 
-def test_used_git_diff_true_when_both_commits_locally_resolvable(monkeypatch):
+def test_commits_available_locally_true_when_both_commits_locally_resolvable(monkeypatch):
     monkeypatch.setattr(regression_insight, "commit_exists_locally", lambda sha, **kw: True)
     from_run = _run(accuracy=0.91, commit=_commit("a" * 40))
     to_run = _run(accuracy=0.79, commit=_commit("b" * 40))
 
-    insight = regression_insight.build_regression_insight(from_run, to_run, metric="accuracy")
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
 
     assert insight is not None
-    assert insight.used_git_diff is True
+    assert insight.commits_available_locally is True
 
 
-def test_used_git_diff_false_when_commits_not_locally_resolvable(monkeypatch):
+def test_commits_available_locally_false_when_commits_not_locally_resolvable(monkeypatch):
     monkeypatch.setattr(regression_insight, "commit_exists_locally", lambda sha, **kw: False)
     from_run = _run(accuracy=0.91, commit=_commit("a" * 40))
     to_run = _run(accuracy=0.79, commit=_commit("b" * 40))
 
-    insight = regression_insight.build_regression_insight(from_run, to_run, metric="accuracy")
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
 
     assert insight is not None
-    assert insight.used_git_diff is False
+    assert insight.commits_available_locally is False
+
+
+# ---------------------------------------------------------------------------
+# Multiple regressed metrics (not just the worst one)
+# ---------------------------------------------------------------------------
+
+
+def test_insight_lists_all_three_regressed_metrics_ordered_worst_first():
+    """similarity, coherence, and avg_latency_seconds all regress together -
+    every one of them must appear in `regressed_metrics`, not just the
+    single worst one, and ordering must be direction-aware (latency rising
+    is a regression, not an improvement)."""
+    from_run = _run(
+        accuracy=0.91,
+        metrics={"similarity": 4.0, "coherence": 4.5, "avg_latency_seconds": 2.0},
+        commit=_commit("a" * 40),
+    )
+    to_run = _run(
+        accuracy=0.91,
+        # similarity: -25%, coherence: -56%, latency: +150% (all regressions)
+        metrics={"similarity": 3.0, "coherence": 2.0, "avg_latency_seconds": 5.0},
+        commit=_commit("b" * 40),
+    )
+
+    insight = regression_insight.build_regression_insight(
+        from_run, to_run, metrics=["similarity", "coherence", "avg_latency_seconds"]
+    )
+
+    assert insight is not None
+    assert [m.metric for m in insight.regressed_metrics] == [
+        "avg_latency_seconds",
+        "coherence",
+        "similarity",
+    ]
+    assert "similarity" in insight.explanation
+    assert "coherence" in insight.explanation
+    assert "avg_latency_seconds" in insight.explanation
+    assert "increased from 2.00 to 5.00" in insight.explanation
+
+
+def test_insight_skips_only_the_metric_missing_a_value_not_the_whole_insight():
+    """`coherence` is missing on `to_run` - the insight should still cover
+    `similarity`, the metric that does have values on both sides, rather
+    than bailing out entirely."""
+    from_run = _run(
+        accuracy=0.91,
+        metrics={"similarity": 4.0, "coherence": 4.5},
+        commit=_commit("a" * 40),
+    )
+    to_run = _run(
+        accuracy=0.91,
+        metrics={"similarity": 3.0},
+        commit=_commit("b" * 40),
+    )
+
+    insight = regression_insight.build_regression_insight(
+        from_run, to_run, metrics=["similarity", "coherence"]
+    )
+
+    assert insight is not None
+    assert [m.metric for m in insight.regressed_metrics] == ["similarity"]
+
+
+# ---------------------------------------------------------------------------
+# regression_severity
+# ---------------------------------------------------------------------------
+
+
+def test_regression_severity_is_direction_aware_for_latency():
+    # Latency rising from 4 to 8 is a 100% regression.
+    assert regression_insight.regression_severity("avg_latency_seconds", 4.0, 8.0) == 1.0
+    # Latency falling is an improvement, not a regression - severity is 0.
+    assert regression_insight.regression_severity("avg_latency_seconds", 4.0, 2.0) == 0.0
+
+
+def test_regression_severity_uses_absolute_change_when_from_value_is_zero_or_negative():
+    assert regression_insight.regression_severity("coherence", 0.0, -5.0) == 5.0
+    assert regression_insight.regression_severity("coherence", -1.0, -2.0) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# report_url (Foundry Evaluations deep-link)
+# ---------------------------------------------------------------------------
+
+
+def test_report_urls_carried_through_when_provided():
+    from_run = _run(accuracy=0.91, commit=_commit("a" * 40))
+    to_run = _run(accuracy=0.79, commit=_commit("b" * 40))
+
+    insight = regression_insight.build_regression_insight(
+        from_run,
+        to_run,
+        metrics=["accuracy"],
+        from_report_url="https://ai.azure.com/foundry/from",
+        to_report_url="https://ai.azure.com/foundry/to",
+    )
+
+    assert insight is not None
+    assert insight.from_report_url == "https://ai.azure.com/foundry/from"
+    assert insight.to_report_url == "https://ai.azure.com/foundry/to"
+
+
+def test_report_urls_are_none_when_not_provided():
+    from_run = _run(accuracy=0.91, commit=_commit("a" * 40))
+    to_run = _run(accuracy=0.79, commit=_commit("b" * 40))
+
+    insight = regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"])
+
+    assert insight is not None
+    assert insight.from_report_url is None
+    assert insight.to_report_url is None
+
+
+def test_resolve_report_url_reads_from_run_config_first(tmp_path):
+    run = _run(cloud_evaluation={"report_url": "https://ai.azure.com/foundry/run1"})
+
+    assert (
+        regression_insight.resolve_report_url(run)
+        == "https://ai.azure.com/foundry/run1"
+    )
+
+
+def test_resolve_report_url_falls_back_to_sidecar_file(tmp_path):
+    run = _run()  # no cloud_evaluation in config - as for a `publish: true` local run
+    results_dir = tmp_path / "run1"
+    results_dir.mkdir()
+    (results_dir / "cloud_evaluation.json").write_text(
+        '{"report_url": "https://ai.azure.com/foundry/classic"}', encoding="utf-8"
+    )
+
+    url = regression_insight.resolve_report_url(
+        run, results_path=results_dir / "results.json"
+    )
+
+    assert url == "https://ai.azure.com/foundry/classic"
+
+
+def test_resolve_report_url_is_none_when_never_published(tmp_path):
+    run = _run()
+    results_dir = tmp_path / "run1"
+    results_dir.mkdir()
+
+    url = regression_insight.resolve_report_url(
+        run, results_path=results_dir / "results.json"
+    )
+
+    assert url is None

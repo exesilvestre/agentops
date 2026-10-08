@@ -7,6 +7,7 @@ from agentops.core.results import (
     CommitInfo,
     ComparisonInfo,
     ComparisonMetric,
+    RegressedMetric,
     RegressionInsight,
     RowMetric,
     RowResult,
@@ -137,9 +138,9 @@ def test_report_renders_regression_insight_section_when_present():
             to_run_id="2026-09-10T14:03:00+00:00",
             from_commit=_commit("a" * 40),
             to_commit=_commit("b" * 40),
-            metric="accuracy",
-            from_value=0.91,
-            to_value=0.79,
+            regressed_metrics=[
+                RegressedMetric(metric="accuracy", from_value=0.91, to_value=0.79)
+            ],
             changed_inputs=[
                 ChangedInput(field="model", description="the model changed from gpt-4o to gpt-4o-mini")
             ],
@@ -148,7 +149,7 @@ def test_report_renders_regression_insight_section_when_present():
                 "Likely cause: the model changed from gpt-4o to gpt-4o-mini."
             ),
             suggested_action="Review the model change; consider reverting it.",
-            used_git_diff=False,
+            commits_available_locally=False,
         ),
     )
 
@@ -160,6 +161,70 @@ def test_report_renders_regression_insight_section_when_present():
     assert "Review the model change" in text
     # The section must come after the existing comparison table.
     assert text.index("## Comparison vs Baseline") < text.index("## Regression Insight")
+
+
+def test_report_lists_every_regressed_metric_and_report_urls():
+    result = _result()
+    result.comparison = ComparisonInfo(
+        baseline_path=".agentops/baseline/results.json",
+        metrics=[
+            ComparisonMetric(
+                metric="coherence", current=2.0, baseline=4.5, delta=-2.5, direction="regressed"
+            ),
+            ComparisonMetric(
+                metric="similarity", current=3.0, baseline=4.0, delta=-1.0, direction="regressed"
+            ),
+        ],
+        insight=RegressionInsight(
+            from_run_id="2026-09-01T10:00:00+00:00",
+            to_run_id="2026-09-10T14:03:00+00:00",
+            from_commit=_commit("a" * 40),
+            to_commit=_commit("b" * 40),
+            regressed_metrics=[
+                RegressedMetric(metric="coherence", from_value=4.5, to_value=2.0),
+                RegressedMetric(metric="similarity", from_value=4.0, to_value=3.0),
+            ],
+            changed_inputs=[],
+            explanation="Run aaaaaaa → bbbbbbb: coherence dropped from 4.50 to 2.00 and similarity dropped from 4.00 to 3.00.",
+            commits_available_locally=False,
+            from_report_url="https://ai.azure.com/foundry/baseline",
+            to_report_url="https://ai.azure.com/foundry/current",
+        ),
+    )
+
+    text = reporter.render(result)
+
+    assert "**Regressed metrics:**" in text
+    assert "`coherence`: 4.500 → 2.000" in text
+    assert "`similarity`: 4.000 → 3.000" in text
+    assert "[Baseline run in Foundry](https://ai.azure.com/foundry/baseline)" in text
+    assert "[Regressed run in Foundry](https://ai.azure.com/foundry/current)" in text
+
+
+def test_report_omits_report_url_links_when_absent():
+    result = _result()
+    result.comparison = ComparisonInfo(
+        baseline_path=".agentops/baseline/results.json",
+        metrics=[
+            ComparisonMetric(
+                metric="accuracy", current=0.79, baseline=0.91, delta=-0.12, direction="regressed"
+            )
+        ],
+        insight=RegressionInsight(
+            from_run_id="2026-09-01T10:00:00+00:00",
+            to_run_id="2026-09-10T14:03:00+00:00",
+            from_commit=_commit("a" * 40),
+            to_commit=_commit("b" * 40),
+            regressed_metrics=[RegressedMetric(metric="accuracy", from_value=0.91, to_value=0.79)],
+            changed_inputs=[],
+            explanation="Run aaaaaaa → bbbbbbb: accuracy dropped from 0.91 to 0.79.",
+            commits_available_locally=False,
+        ),
+    )
+
+    text = reporter.render(result)
+
+    assert "Foundry]" not in text
 
 
 def test_report_has_no_regression_insight_section_when_absent():

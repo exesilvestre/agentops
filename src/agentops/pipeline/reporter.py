@@ -228,10 +228,21 @@ def _render_comparison(comparison: ComparisonInfo) -> List[str]:
 
 def _render_regression_insight(insight: RegressionInsight) -> List[str]:
     lines = ["## Regression Insight", ""]
+    if len(insight.regressed_metrics) > 1:
+        lines.append("**Regressed metrics:**")
+        for rm in insight.regressed_metrics:
+            lines.append(f"- `{rm.metric}`: {rm.from_value:.3f} → {rm.to_value:.3f}")
+        lines.append("")
     lines.append(_short(insight.explanation, 500))
     if insight.suggested_action:
         lines.append("")
         lines.append(f"**Suggested action:** {_short(insight.suggested_action, 300)}")
+    if insight.from_report_url or insight.to_report_url:
+        lines.append("")
+        if insight.from_report_url:
+            lines.append(f"- [Baseline run in Foundry]({insight.from_report_url})")
+        if insight.to_report_url:
+            lines.append(f"- [Regressed run in Foundry]({insight.to_report_url})")
     return lines
 
 

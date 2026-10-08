@@ -107,20 +107,46 @@ class ChangedInput(BaseModel):
     to_value: Optional[str] = None
 
 
+class RegressedMetric(BaseModel):
+    """One metric's before/after values in a detected regression."""
+
+    metric: str
+    from_value: float
+    to_value: float
+
+
 class RegressionInsight(BaseModel):
-    """Causal explanation for a detected regression between two runs."""
+    """Causal explanation for a detected regression between two runs.
+
+    Lists every metric that regressed between the two runs, not just the
+    single worst one - a prompt/model/dataset change between two runs
+    commonly moves several metrics at once, and the other surfaces (Doctor
+    reports one finding per metric already) shouldn't be narrower than that.
+    """
 
     from_run_id: str
     to_run_id: str
     from_commit: Optional[CommitInfo] = None
     to_commit: Optional[CommitInfo] = None
-    metric: str
-    from_value: float
-    to_value: float
+    # Ordered worst-first (direction-aware - see
+    # `pipeline.regression_insight.regression_severity`).
+    regressed_metrics: List[RegressedMetric]
     changed_inputs: List[ChangedInput] = Field(default_factory=list)
     explanation: str
     suggested_action: Optional[str] = None
-    used_git_diff: bool = False
+    # Whether both commits were present in local git history. Does not mean
+    # a `git diff` of either tree was run - the explanation above is always
+    # built purely from fields already recorded on each run's RunResult (see
+    # `pipeline.regression_insight`'s module docstring). True only means a
+    # fuller history-based diff would have been *possible*.
+    commits_available_locally: bool = False
+    # Deep-link to the Foundry Evaluations page for each run, when it was
+    # published there (`execution: cloud`, or local `publish: true` after
+    # its Classic Foundry publish step has completed) - see
+    # `pipeline.regression_insight.resolve_report_url`. Informational only;
+    # `None` whenever a run wasn't published, never fabricated.
+    from_report_url: Optional[str] = None
+    to_report_url: Optional[str] = None
 
 
 class ComparisonInfo(BaseModel):

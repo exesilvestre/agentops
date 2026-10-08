@@ -8,13 +8,26 @@ Comparisons are made purely from fields already recorded on each run's
 ``RunResult`` (target, config, dataset, evaluators, thresholds) - no git
 tree access, no network calls, no LLM calls, per the feature's determinism
 requirement.
+
+Caveat: a Foundry prompt-agent system-prompt change is only detected via a
+``name:version`` bump (see ``_target_changes``) - editing a prompt's content
+without publishing a new version produces no ``system_prompt`` entry in
+``changed_inputs``, since no prompt text or content hash is captured on
+``RunResult`` to diff against.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agentops.core.results import ChangedInput, RegressionInsight, RunResult
+from agentops.core.results import (
+    ChangedInput,
+    RegressedMetric,
+    RegressionInsight,
+    RunResult,
+)
 from agentops.pipeline.commit_info import commit_exists_locally
 
 _TRACKED_CONFIG_FIELDS = ("dataset", "evaluators", "thresholds")
@@ -26,6 +39,85 @@ _SUGGESTION_LABELS: Dict[str, str] = {
     "evaluators": "evaluator-set change",
     "thresholds": "threshold change",
 }
+
+# Metrics where a lower value is the better outcome. Every other metric
+# (and every evaluator's default threshold - see `core/evaluators.py`,
+# where this is the only metric with a `<=` default) is treated as
+# higher-is-better. Lives here (rather than `pipeline.comparison`, its only
+# other consumer) because this module has no dependency on `comparison`,
+# while `comparison` already depends on this module for
+# `build_regression_insight` - putting it here avoids a circular import.
+LOWER_IS_BETTER_METRICS = frozenset({"avg_latency_seconds"})
+
+
+def metric_improved(
+    metric: str, current: Optional[float], baseline: Optional[float]
+) -> Optional[bool]:
+    """Whether ``current`` is a better outcome than ``baseline`` for ``metric``.
+
+    Returns ``None`` when the values are missing or equal (no judgement to
+    make), ``True`` when ``current`` is the better value, ``False`` when
+    it's worse - accounting for ``metric`` being lower-is-better (e.g.
+    latency) vs. the higher-is-better default.
+    """
+    if current is None or baseline is None or current == baseline:
+        return None
+    if metric in LOWER_IS_BETTER_METRICS:
+        return current < baseline
+    return current > baseline
+
+
+def regression_severity(metric: str, from_value: float, to_value: float) -> float:
+    """How severely ``metric`` regressed from ``from_value`` to ``to_value``,
+    as a fraction of ``from_value`` when that's meaningful, else as an
+    absolute change. Used only to order ``RegressionInsight.regressed_metrics``
+    worst-first - direction-aware, so a lower-is-better metric (e.g.
+    latency) getting worse produces a positive value just like any other
+    regression. A ``from_value`` at or below zero can't produce a
+    meaningful ratio, so the absolute change is used instead of collapsing
+    to zero.
+    """
+    worse_by = (
+        to_value - from_value
+        if metric in LOWER_IS_BETTER_METRICS
+        else from_value - to_value
+    )
+    if worse_by <= 0:
+        return 0.0
+    if from_value <= 0:
+        return worse_by
+    return worse_by / from_value
+
+
+def resolve_report_url(run: RunResult, *, results_path: Optional[Path] = None) -> Optional[str]:
+    """The Foundry Evaluations deep-link for ``run``, when it was published.
+
+    Checks the run's own recorded config first (``execution: cloud`` embeds
+    ``report_url`` there before ``results.json`` is even written), then -
+    when ``results_path`` is given - a sibling ``cloud_evaluation.json``
+    (written by a completed local ``publish: true`` Classic Foundry publish
+    step, which happens *after* ``results.json`` and so is never in the
+    run's own config). Returns ``None`` - never raises - whenever neither
+    source has a URL, e.g. the run was never published.
+    """
+    cloud_evaluation = (run.config or {}).get("cloud_evaluation")
+    if isinstance(cloud_evaluation, dict):
+        url = cloud_evaluation.get("report_url")
+        if isinstance(url, str) and url:
+            return url
+
+    if results_path is not None:
+        sidecar = results_path.parent / "cloud_evaluation.json"
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if isinstance(data, dict):
+            url = data.get("report_url")
+            if isinstance(url, str) and url:
+                return url
+
+    return None
 
 
 def _target_changes(from_run: RunResult, to_run: RunResult) -> List[ChangedInput]:
@@ -125,30 +217,36 @@ def build_changed_inputs(from_run: RunResult, to_run: RunResult) -> List[Changed
     return _target_changes(from_run, to_run) + _config_changes(from_run, to_run)
 
 
+def _join_with_and(items: List[str]) -> str:
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _describe_metric_change(metric: RegressedMetric) -> str:
+    # Every entry here is, by construction, a regression - and for both a
+    # higher-is-better metric dropping and a lower-is-better metric (e.g.
+    # latency) rising, "got worse" always matches this raw numeric
+    # comparison, so no direction lookup is needed just to word it.
+    verb = "dropped" if metric.to_value < metric.from_value else "increased"
+    return f"{metric.metric} {verb} from {metric.from_value:.2f} to {metric.to_value:.2f}"
+
+
 def _explanation(
     *,
-    metric: str,
-    from_value: float,
-    to_value: float,
+    regressed_metrics: List[RegressedMetric],
     changed_inputs: List[ChangedInput],
     from_short_sha: str,
     to_short_sha: str,
 ) -> str:
-    direction = "dropped" if to_value < from_value else "changed"
-    base = (
-        f"Run {from_short_sha} → {to_short_sha}: {metric} {direction} "
-        f"from {from_value:.2f} to {to_value:.2f}."
-    )
+    metrics_text = _join_with_and([_describe_metric_change(m) for m in regressed_metrics])
+    base = f"Run {from_short_sha} → {to_short_sha}: {metrics_text}."
     if not changed_inputs:
         return base
 
-    descriptions = [c.description for c in changed_inputs]
-    if len(descriptions) == 1:
-        cause = descriptions[0]
-    elif len(descriptions) == 2:
-        cause = f"{descriptions[0]} and {descriptions[1]}"
-    else:
-        cause = ", ".join(descriptions[:-1]) + f", and {descriptions[-1]}"
+    cause = _join_with_and([c.description for c in changed_inputs])
     return f"{base} Likely cause: {cause}."
 
 
@@ -158,54 +256,81 @@ def _suggested_action(changed_inputs: List[ChangedInput]) -> Optional[str]:
     labels = [_SUGGESTION_LABELS.get(c.field, f"{c.field} change") for c in changed_inputs]
     if len(labels) == 1:
         return f"Review the {labels[0]} to confirm it's the cause, and revert it if so."
-    joined = ", ".join(labels[:-1]) + f", and {labels[-1]}" if len(labels) > 2 else " and ".join(labels)
-    return f"Review the {joined}; consider reverting one at a time to isolate the cause."
+    return f"Review the {_join_with_and(labels)}; consider reverting one at a time to isolate the cause."
 
 
 def build_regression_insight(
     from_run: RunResult,
     to_run: RunResult,
     *,
-    metric: str,
+    metrics: List[str],
+    workspace: Optional[Path] = None,
+    from_report_url: Optional[str] = None,
+    to_report_url: Optional[str] = None,
 ) -> Optional[RegressionInsight]:
-    """Explain a regression on ``metric`` between two comparable runs.
+    """Explain a regression on ``metrics`` between two comparable runs.
+
+    ``metrics`` is every metric known to have regressed between the two
+    runs (not just the worst one) - all of them are listed in the returned
+    insight's ``regressed_metrics``, ordered worst-first
+    (``regression_severity``), so the explanation and the report/Cockpit
+    surfaces consuming it don't silently drop all but one when several
+    metrics move together.
 
     Returns ``None`` (produces no fabricated cause) when either run lacks
-    commit metadata or the metric's value isn't present on both runs,
-    per FR-009. Otherwise diffs the runs' recorded fields (see
-    ``build_changed_inputs``) and renders a plain-language explanation plus
-    a short suggested corrective action.
+    commit metadata, or when none of ``metrics`` has a value on both runs,
+    per FR-009 - an individual metric missing a value on either side is
+    just skipped rather than failing the whole insight. Otherwise diffs the
+    runs' recorded fields (see ``build_changed_inputs``) and renders a
+    plain-language explanation plus a short suggested corrective action.
+
+    ``workspace`` is the directory the two commits' repository lives in;
+    it's forwarded to the local git lookups below so they run against the
+    right checkout instead of the current process's cwd. ``from_report_url``
+    /``to_report_url`` (see ``resolve_report_url``) are carried through
+    as-is - this function does no file I/O to resolve them itself, since
+    only the caller knows whether a run's ``results.json`` path is
+    available to check for a sidecar ``cloud_evaluation.json``.
     """
     if from_run.commit is None or to_run.commit is None:
         return None
 
-    from_value = from_run.aggregate_metrics.get(metric)
-    to_value = to_run.aggregate_metrics.get(metric)
-    if from_value is None or to_value is None:
+    regressed_metrics: List[RegressedMetric] = []
+    for metric in metrics:
+        from_value = from_run.aggregate_metrics.get(metric)
+        to_value = to_run.aggregate_metrics.get(metric)
+        if from_value is None or to_value is None:
+            continue
+        regressed_metrics.append(
+            RegressedMetric(metric=metric, from_value=from_value, to_value=to_value)
+        )
+    if not regressed_metrics:
         return None
+    regressed_metrics.sort(
+        key=lambda m: regression_severity(m.metric, m.from_value, m.to_value),
+        reverse=True,
+    )
 
     changed_inputs = build_changed_inputs(from_run, to_run)
-    used_git_diff = commit_exists_locally(from_run.commit.sha) and commit_exists_locally(
-        to_run.commit.sha
-    )
+    commits_available_locally = commit_exists_locally(
+        from_run.commit.sha, workspace=workspace
+    ) and commit_exists_locally(to_run.commit.sha, workspace=workspace)
 
     return RegressionInsight(
         from_run_id=from_run.started_at,
         to_run_id=to_run.started_at,
         from_commit=from_run.commit,
         to_commit=to_run.commit,
-        metric=metric,
-        from_value=from_value,
-        to_value=to_value,
+        regressed_metrics=regressed_metrics,
         changed_inputs=changed_inputs,
         explanation=_explanation(
-            metric=metric,
-            from_value=from_value,
-            to_value=to_value,
+            regressed_metrics=regressed_metrics,
             changed_inputs=changed_inputs,
             from_short_sha=from_run.commit.short_sha,
             to_short_sha=to_run.commit.short_sha,
         ),
         suggested_action=_suggested_action(changed_inputs),
-        used_git_diff=used_git_diff,
+        commits_available_locally=commits_available_locally,
+        from_report_url=from_report_url,
+        to_report_url=to_report_url,
     )

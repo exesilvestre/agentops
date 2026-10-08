@@ -82,8 +82,8 @@
   fallback, missing-git/non-repo handling.
 - `tests/unit/test_regression_insight.py` — field-diff detection (prompt,
   model, dataset, evaluators, thresholds), the "both commits missing" and
-  "one commit missing" no-fabrication paths, and the `used_git_diff`
-  fallback branch.
+  "one commit missing" no-fabrication paths, and the
+  `commits_available_locally` fallback branch.
 - `tests/unit/test_reporter.py` — new "Regression Insight" section rendering,
   and its absence when `insight` is `None`.
 - `tests/unit/test_cockpit.py` — `_project_run` commit/`changed_inputs`

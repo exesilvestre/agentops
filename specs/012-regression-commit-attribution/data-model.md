@@ -43,13 +43,15 @@ The causal explanation for a detected regression between two comparable runs.
 | `to_run_id` | `str` | Identifier of the regressed run. |
 | `from_commit` | `Optional[CommitInfo]` | Prior run's commit, if known. |
 | `to_commit` | `Optional[CommitInfo]` | Regressed run's commit, if known. |
-| `metric` | `str` | The regressed metric's name. |
-| `from_value` | `float` | Metric value on the prior run. |
-| `to_value` | `float` | Metric value on the regressed run. |
+| `regressed_metrics` | `List[RegressedMetric]` | Every metric that regressed between the two runs, not just the worst one, ordered worst-first (direction-aware). Each entry: `{metric: str, from_value: float, to_value: float}`. |
 | `changed_inputs` | `List[ChangedInput]` | All detected changes, not just the first found (per spec edge case). |
-| `explanation` | `str` | The rendered one-to-two-sentence plain-language summary (FR-007). |
+| `explanation` | `str` | The rendered plain-language summary covering every entry in `regressed_metrics` (FR-007). |
 | `suggested_action` | `Optional[str]` | Brief, rule-based corrective suggestion (FR-008). |
-| `used_git_diff` | `bool` | `True` when both commits were reachable in local git history for a fuller diff; `False` when this fell back to comparing only the fields already recorded in each run's stored result (research.md #4). |
+| `commits_available_locally` | `bool` | `True` when both commits were reachable in local git history, `False` otherwise (e.g. a shallow CI checkout per research.md #4). Informational only - the comparison itself is always the field-based diff described in research.md #4/#5, never a tree-level `git diff`, regardless of this value. |
+| `from_report_url` | `Optional[str]` | Foundry Evaluations deep-link for the prior run, when it was published (`execution: cloud`, or local `publish: true` after its publish step completed). `None` when not published - never fabricated. |
+| `to_report_url` | `Optional[str]` | Same, for the regressed run. |
+
+A `RegressedMetric` has `metric: str`, `from_value: float`, `to_value: float`.
 
 **Validation rule**: A `RegressionInsight` is only ever constructed when both
 `from_commit` and `to_commit` are non-`None` (FR-006, FR-009). If either run

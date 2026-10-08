@@ -29,8 +29,9 @@ MUST treat a missing/`null` `commit` the same as before this feature existed.
 ## New field on `comparison`: `insight`
 
 Only present when `comparison` (the existing `--baseline` block) is present
-**and** a regression was detected **and** both the current and baseline runs
-have non-null `commit`:
+**and** at least one metric regressed **and** both the current and baseline
+runs have non-null `commit`. `regressed_metrics` lists every metric that
+regressed, not just the worst one, ordered worst-first:
 
 ```jsonc
 {
@@ -41,25 +42,30 @@ have non-null `commit`:
       "to_run_id": "20260910-140300",
       "from_commit": { "sha": "...", "short_sha": "...", "subject": "...", "author": "...", "authored_at": "...", "source": "ci" },
       "to_commit": { "sha": "...", "short_sha": "...", "subject": "...", "author": "...", "authored_at": "...", "source": "ci" },
-      "metric": "accuracy",
-      "from_value": 0.91,
-      "to_value": 0.79,
+      "regressed_metrics": [
+        { "metric": "accuracy", "from_value": 0.91, "to_value": 0.79 }
+      ],
       "changed_inputs": [
         { "field": "system_prompt", "description": "the system prompt changed", "from_value": "greeter:v3", "to_value": "greeter:v4" },
         { "field": "model", "description": "model changed from gpt-4o to gpt-4o-mini", "from_value": "gpt-4o", "to_value": "gpt-4o-mini" }
       ],
       "explanation": "Run v3 → v4: accuracy dropped from 0.91 to 0.79. Likely cause: the system prompt changed and the model changed from gpt-4o to gpt-4o-mini.",
       "suggested_action": "Review the prompt change and the model swap; consider reverting one at a time to isolate the cause.",
-      "used_git_diff": false
+      "commits_available_locally": false,
+      "from_report_url": null,
+      "to_report_url": null
     }
   }
 }
 ```
 
-Absent (`comparison.insight` key not present) whenever no regression was
-detected, either compared run lacks commit metadata, or `comparison` itself
-is absent (no `--baseline` was used). This preserves every existing
-`comparison`-shaped consumer.
+Serialized as `comparison.insight: null` (the key is present, since
+`model_dump(mode="json")` is called without `exclude_none`) whenever no
+metric regressed or either compared run lacks commit metadata. When
+`comparison` itself is absent (no `--baseline` was used), there is no
+nested `insight` field at all. Either way, every existing
+`comparison`-shaped consumer that ignores unknown-to-it or null fields is
+unaffected.
 
 ## No changes to exit codes or CLI flags
 

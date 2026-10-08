@@ -25,11 +25,14 @@ def _run(
     deployment: str | None = "gpt-4o",
     accuracy: float,
     coherence: float | None = None,
+    avg_latency_seconds: float | None = None,
     commit: CommitInfo | None,
 ) -> RunResult:
     metrics = {"accuracy": accuracy}
     if coherence is not None:
         metrics["coherence"] = coherence
+    if avg_latency_seconds is not None:
+        metrics["avg_latency_seconds"] = avg_latency_seconds
     return RunResult(
         started_at="2026-09-01T10:00:00+00:00",
         finished_at="2026-09-01T10:00:01+00:00",
@@ -66,9 +69,10 @@ def test_build_comparison_attaches_insight_when_regressed_and_commits_known():
     )
 
     assert info.insight is not None
-    assert info.insight.metric == "accuracy"
-    assert info.insight.from_value == 0.91
-    assert info.insight.to_value == 0.79
+    assert len(info.insight.regressed_metrics) == 1
+    assert info.insight.regressed_metrics[0].metric == "accuracy"
+    assert info.insight.regressed_metrics[0].from_value == 0.91
+    assert info.insight.regressed_metrics[0].to_value == 0.79
 
 
 def test_build_comparison_no_insight_without_commit_metadata():
@@ -82,10 +86,11 @@ def test_build_comparison_no_insight_without_commit_metadata():
     assert info.insight is None
 
 
-def test_build_comparison_picks_worst_relative_drop_not_alphabetical_first():
-    """`accuracy` sorts before `coherence` alphabetically, but `coherence`
-    dropped much more in relative terms (56% vs 13%) - the insight must be
-    for `coherence`, not whichever metric name comes first.
+def test_build_comparison_lists_every_regressed_metric_ordered_worst_first():
+    """`accuracy` and `coherence` both regress at once (13% and 56%
+    respectively) - both must appear in the insight, worst first, not just
+    whichever metric name sorts first alphabetically or a single "worst"
+    one with the rest silently dropped.
     """
     baseline = _run(
         version="3", deployment="gpt-4o", accuracy=0.91, coherence=4.5, commit=_commit("a" * 40)
@@ -99,7 +104,7 @@ def test_build_comparison_picks_worst_relative_drop_not_alphabetical_first():
     )
 
     assert info.insight is not None
-    assert info.insight.metric == "coherence"
+    assert [m.metric for m in info.insight.regressed_metrics] == ["coherence", "accuracy"]
 
 
 def test_build_comparison_no_insight_when_nothing_regressed():
@@ -111,3 +116,56 @@ def test_build_comparison_no_insight_when_nothing_regressed():
     )
 
     assert info.insight is None
+
+
+def test_latency_drop_is_improved_not_regressed():
+    """``avg_latency_seconds`` is lower-is-better - a drop from 8s to 3s is
+    an improvement, not a regression, even though the raw value went down."""
+    baseline = _run(accuracy=0.91, avg_latency_seconds=8.0, commit=_commit("a" * 40))
+    current = _run(accuracy=0.91, avg_latency_seconds=3.0, commit=_commit("b" * 40))
+
+    info = comparison.build_comparison(
+        current=current, baseline=baseline, baseline_path=Path(".agentops/baseline/results.json")
+    )
+
+    latency_metric = next(m for m in info.metrics if m.metric == "avg_latency_seconds")
+    assert latency_metric.direction == "improved"
+    assert info.insight is None
+
+
+def test_latency_increase_is_regressed_and_explained():
+    baseline = _run(accuracy=0.91, avg_latency_seconds=3.0, commit=_commit("a" * 40))
+    current = _run(accuracy=0.91, avg_latency_seconds=8.0, commit=_commit("b" * 40))
+
+    info = comparison.build_comparison(
+        current=current, baseline=baseline, baseline_path=Path(".agentops/baseline/results.json")
+    )
+
+    latency_metric = next(m for m in info.metrics if m.metric == "avg_latency_seconds")
+    assert latency_metric.direction == "regressed"
+    assert info.insight is not None
+    assert info.insight.regressed_metrics[0].metric == "avg_latency_seconds"
+
+
+def test_insight_carries_baseline_report_url_from_sidecar_file(tmp_path: Path):
+    """``baseline`` is a prior, fully-published run - a sidecar
+    ``cloud_evaluation.json`` next to its ``results.json`` (as a completed
+    local ``publish: true`` run would have) must surface as
+    ``from_report_url``. ``current`` is still mid-orchestration (no file on
+    disk yet), so ``to_report_url`` stays ``None`` unless its own in-memory
+    config already has it (``execution: cloud``)."""
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    baseline_path = baseline_dir / "results.json"
+    (baseline_dir / "cloud_evaluation.json").write_text(
+        '{"report_url": "https://ai.azure.com/foundry/baseline"}', encoding="utf-8"
+    )
+
+    baseline = _run(version="3", deployment="gpt-4o", accuracy=0.91, commit=_commit("a" * 40))
+    current = _run(version="4", deployment="gpt-4o-mini", accuracy=0.79, commit=_commit("b" * 40))
+
+    info = comparison.build_comparison(current=current, baseline=baseline, baseline_path=baseline_path)
+
+    assert info.insight is not None
+    assert info.insight.from_report_url == "https://ai.azure.com/foundry/baseline"
+    assert info.insight.to_report_url is None

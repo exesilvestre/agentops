@@ -12,7 +12,17 @@ from agentops.core.results import (
     ComparisonRow,
     RunResult,
 )
-from agentops.pipeline.regression_insight import build_regression_insight
+from agentops.pipeline.regression_insight import (
+    LOWER_IS_BETTER_METRICS,
+    build_regression_insight,
+    metric_improved,
+    resolve_report_url,
+)
+
+# Re-exported for callers that only need the metric-direction concept
+# without pulling in regression-insight building - the single source of
+# truth lives in `regression_insight` (see its module comment for why).
+__all__ = ["LOWER_IS_BETTER_METRICS", "metric_improved", "load_baseline", "build_comparison"]
 
 
 def load_baseline(path: Path) -> RunResult:
@@ -24,14 +34,11 @@ def load_baseline(path: Path) -> RunResult:
     return RunResult.model_validate(payload)
 
 
-def _direction(current: Optional[float], baseline: Optional[float]) -> str:
-    if current is None or baseline is None:
+def _direction(metric: str, current: Optional[float], baseline: Optional[float]) -> str:
+    improved = metric_improved(metric, current, baseline)
+    if improved is None:
         return "unchanged"
-    if current > baseline:
-        return "improved"
-    if current < baseline:
-        return "regressed"
-    return "unchanged"
+    return "improved" if improved else "regressed"
 
 
 def _row_passed(row_metrics: List[Dict[str, float | None]]) -> bool:
@@ -39,23 +46,12 @@ def _row_passed(row_metrics: List[Dict[str, float | None]]) -> bool:
     return all("error" not in metric or not metric["error"] for metric in row_metrics)
 
 
-def _relative_drop(metric: ComparisonMetric) -> float:
-    """Fraction the metric dropped relative to baseline (same formula as
-    ``agent.checks.regression``'s rolling-baseline drop calculation), used to
-    pick which regressed metric to attribute a cause to when several
-    regressed at once. Non-positive or missing baselines can't produce a
-    meaningful ratio, so they sort last rather than raising.
-    """
-    if metric.baseline is None or metric.current is None or metric.baseline <= 0:
-        return 0.0
-    return (metric.baseline - metric.current) / metric.baseline
-
-
 def build_comparison(
     *,
     current: RunResult,
     baseline: RunResult,
     baseline_path: Path,
+    workspace: Optional[Path] = None,
 ) -> ComparisonInfo:
     metrics: List[ComparisonMetric] = []
     metric_names = sorted(set(current.aggregate_metrics) | set(baseline.aggregate_metrics))
@@ -73,7 +69,7 @@ def build_comparison(
                 current=current_value,
                 baseline=baseline_value,
                 delta=delta,
-                direction=_direction(current_value, baseline_value),
+                direction=_direction(name, current_value, baseline_value),
             )
         )
 
@@ -116,8 +112,19 @@ def build_comparison(
     if current.commit is not None and baseline.commit is not None:
         regressed = [m for m in metrics if m.direction == "regressed"]
         if regressed:
-            worst = max(regressed, key=_relative_drop)
-            insight = build_regression_insight(baseline, current, metric=worst.metric)
+            insight = build_regression_insight(
+                baseline,
+                current,
+                metrics=[m.metric for m in regressed],
+                workspace=workspace,
+                # `baseline` is a prior, fully-published run - a sidecar
+                # `cloud_evaluation.json` next to it, if any, is complete.
+                # `current` is still mid-orchestration here (persisted
+                # after this call, Classic Foundry `publish: true` later
+                # still) - only its own in-memory config can be checked.
+                from_report_url=resolve_report_url(baseline, results_path=baseline_path),
+                to_report_url=resolve_report_url(current),
+            )
 
     return ComparisonInfo(
         baseline_path=str(baseline_path),
