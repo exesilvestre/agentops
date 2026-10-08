@@ -8,6 +8,7 @@ from, for both CI and local execution.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -15,13 +16,46 @@ from typing import Literal, Optional
 
 from agentops.core.results import CommitInfo
 
-_CI_SHA_ENV_VARS = ("GITHUB_SHA", "BUILD_SOURCEVERSION", "Build.SourceVersion")
+_CI_SHA_ENV_VARS = ("GITHUB_SHA", "BUILD_SOURCEVERSION")
 _FIELD_SEP = "\x1f"
 _GIT_SHOW_FORMAT = f"%H{_FIELD_SEP}%h{_FIELD_SEP}%s{_FIELD_SEP}%an{_FIELD_SEP}%aI"
 _GIT_TIMEOUT_SECONDS = 5
 
 
+def _pull_request_head_sha() -> Optional[str]:
+    """The PR's head commit, read from the GitHub Actions event payload.
+
+    On ``pull_request`` events ``GITHUB_SHA`` is the temporary merge commit
+    GitHub synthesizes for the PR, not the commit the PR branch is actually
+    at - so it must not be used to attribute a run to "the commit under
+    review". ``GITHUB_EVENT_PATH`` points at a JSON payload containing the
+    real head SHA at ``pull_request.head.sha``.
+    """
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        return None
+    try:
+        with open(event_path, "r", encoding="utf-8") as handle:
+            event = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return None
+    head = pull_request.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha or None
+
+
 def _ci_git_sha() -> Optional[str]:
+    if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+        head_sha = _pull_request_head_sha()
+        if head_sha:
+            return head_sha
     for env_var in _CI_SHA_ENV_VARS:
         value = os.environ.get(env_var)
         if value:
