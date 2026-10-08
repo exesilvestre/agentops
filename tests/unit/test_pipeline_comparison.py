@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentops.core.results import CommitInfo, RunResult, RunSummary, TargetInfo
+from agentops.core.results import (
+    CommitInfo,
+    RunResult,
+    RunSummary,
+    TargetInfo,
+    ThresholdEvaluation,
+)
 from agentops.pipeline import comparison
 
 
@@ -145,6 +151,40 @@ def test_latency_increase_is_regressed_and_explained():
     assert latency_metric.direction == "regressed"
     assert info.insight is not None
     assert info.insight.regressed_metrics[0].metric == "avg_latency_seconds"
+
+
+def _with_threshold(run: RunResult, *, metric: str, criteria: str) -> RunResult:
+    run.thresholds = [
+        ThresholdEvaluation(metric=metric, criteria=criteria, expected="", actual="", passed=True)
+    ]
+    return run
+
+
+def test_custom_lower_is_better_metric_drop_is_improved_not_regressed():
+    """``LOWER_IS_BETTER_METRICS`` only covers the one built-in metric known
+    to commonly be lower-is-better (latency) - any other metric name can
+    still be configured as lower-is-better via an explicit `<=`/`<`
+    threshold in agentops.yaml (or a custom metric execution: azd imports).
+    A drop in such a metric must be read from its own recorded threshold
+    criteria, not assumed higher-is-better by default."""
+    baseline = _with_threshold(
+        _run(accuracy=0.91, commit=_commit("a" * 40)),
+        metric="error_rate",
+        criteria="<=",
+    )
+    baseline.aggregate_metrics["error_rate"] = 0.10
+    current = _with_threshold(
+        _run(accuracy=0.91, commit=_commit("b" * 40)), metric="error_rate", criteria="<="
+    )
+    current.aggregate_metrics["error_rate"] = 0.04
+
+    info = comparison.build_comparison(
+        current=current, baseline=baseline, baseline_path=Path(".agentops/baseline/results.json")
+    )
+
+    error_rate_metric = next(m for m in info.metrics if m.metric == "error_rate")
+    assert error_rate_metric.direction == "improved"
+    assert info.insight is None
 
 
 def test_insight_carries_baseline_report_url_from_sidecar_file(tmp_path: Path):

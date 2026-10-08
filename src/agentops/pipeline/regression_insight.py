@@ -27,6 +27,7 @@ from agentops.core.results import (
     RegressedMetric,
     RegressionInsight,
     RunResult,
+    TargetInfo,
 )
 from agentops.pipeline.commit_info import commit_exists_locally
 
@@ -318,6 +319,42 @@ def _suggested_action(changed_inputs: List[ChangedInput]) -> Optional[str]:
     return f"Review the {_join_with_and(labels)}; consider reverting one at a time to isolate the cause."
 
 
+def _agent_identity(target: TargetInfo) -> Optional[str]:
+    """Mirrors ``cockpit._version_lineage_key``'s / ``results_history._lineage_key``'s
+    dict-based ``agent_identity`` resolution, for a ``RunResult.target``
+    (``TargetInfo``) directly - see those functions' docstrings for why
+    ``url`` wins over ``name``, and why ``model_direct`` uses ``kind``
+    rather than ``raw``.
+    """
+    if target.url:
+        return target.url
+    if target.name:
+        return target.name
+    if target.kind == "model_direct":
+        return target.kind
+    return target.raw
+
+
+def same_lineage(from_run: RunResult, to_run: RunResult) -> bool:
+    """Whether two runs are comparable for causal regression attribution
+    (FR-005): same dataset, evaluator set, and agent identity - but
+    deliberately version/deployment-blind, matching the lineage rule
+    Doctor's own ``previous_run`` selection already enforces by
+    construction (see ``agent.checks.regression``). An explicit
+    ``--baseline`` file has no such guarantee built in (the user can point
+    it at any ``results.json``), so ``build_regression_insight`` checks
+    this itself rather than trusting every caller to have already
+    filtered for it - comparing two runs of different agents, datasets, or
+    evaluator sets could otherwise produce a "likely cause" that isn't
+    real.
+    """
+    if from_run.dataset_path != to_run.dataset_path:
+        return False
+    if sorted(from_run.evaluators) != sorted(to_run.evaluators):
+        return False
+    return _agent_identity(from_run.target) == _agent_identity(to_run.target)
+
+
 def build_regression_insight(
     from_run: RunResult,
     to_run: RunResult,
@@ -337,7 +374,9 @@ def build_regression_insight(
     metrics move together.
 
     Returns ``None`` (produces no fabricated cause) when either run lacks
-    commit metadata, or when none of ``metrics`` has a value on both runs,
+    commit metadata, when the two runs aren't comparable in the first
+    place (``same_lineage`` - FR-005: different agent, dataset, or
+    evaluator set), or when none of ``metrics`` has a value on both runs,
     per FR-009 - an individual metric missing a value on either side is
     just skipped rather than failing the whole insight. Otherwise diffs the
     runs' recorded fields (see ``build_changed_inputs``) and renders a
@@ -352,6 +391,8 @@ def build_regression_insight(
     available to check for a sidecar ``cloud_evaluation.json``.
     """
     if from_run.commit is None or to_run.commit is None:
+        return None
+    if not same_lineage(from_run, to_run):
         return None
 
     regressed_metrics: List[RegressedMetric] = []

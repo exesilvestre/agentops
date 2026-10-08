@@ -156,6 +156,48 @@ def test_no_insight_when_to_commit_missing():
     assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
 
 
+def test_no_insight_when_agent_identity_differs():
+    """FR-005: two runs of different agents aren't comparable for causal
+    attribution, even with commit metadata and an apparent metric drop -
+    an explicit --baseline file has no guarantee it points at the same
+    agent, unlike Doctor's own previous_run selection (lineage-filtered by
+    construction)."""
+    from_run = _run(name="greeter", accuracy=0.91, commit=_commit("a" * 40))
+    to_run = _run(name="other-agent", accuracy=0.79, commit=_commit("b" * 40))
+
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
+
+
+def test_no_insight_when_dataset_differs():
+    from_run = _run(dataset_path="data/a.jsonl", accuracy=0.91, commit=_commit("a" * 40))
+    to_run = _run(dataset_path="data/b.jsonl", accuracy=0.79, commit=_commit("b" * 40))
+
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
+
+
+def test_no_insight_when_evaluators_differ():
+    from_run = _run(
+        evaluators=["CoherenceEvaluator"], accuracy=0.91, commit=_commit("a" * 40)
+    )
+    to_run = _run(
+        evaluators=["CoherenceEvaluator", "FluencyEvaluator"],
+        accuracy=0.79,
+        commit=_commit("b" * 40),
+    )
+
+    assert regression_insight.build_regression_insight(from_run, to_run, metrics=["accuracy"]) is None
+
+
+def test_same_lineage_is_version_blind():
+    """A version/deployment bump alone must not count as a lineage
+    mismatch - that's exactly the change this feature exists to attribute
+    a regression to."""
+    from_run = _run(version="3", deployment="gpt-4o", commit=_commit("a" * 40))
+    to_run = _run(version="4", deployment="gpt-4o-mini", commit=_commit("b" * 40))
+
+    assert regression_insight.same_lineage(from_run, to_run) is True
+
+
 def test_no_insight_when_metric_missing_on_either_run():
     from_run = _run(commit=_commit("a" * 40))
     to_run = _run(commit=_commit("b" * 40))

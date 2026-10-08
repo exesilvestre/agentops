@@ -68,6 +68,37 @@ class _WrongAnswerHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ToggleHandler(BaseHTTPRequestHandler):
+    """Answers correctly or incorrectly depending on a shared class-level
+    flag, so the *same* agent URL (and dataset) can simulate "this agent's
+    behavior changed between two commits" without actually changing
+    identity - build_regression_insight now requires the compared runs'
+    agent/dataset/evaluators to match (FR-005 comparability) before
+    producing a causal insight, which a real `--baseline` comparison
+    against a different dataset/endpoint correctly no longer does.
+    """
+
+    answer_correctly = True
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        if type(self).answer_correctly:
+            message = body.get("message", "")
+            answer = _EXACT_ANSWERS.get(message, "")
+        else:
+            answer = "completely unrelated response"
+        payload = json.dumps({"text": answer}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args, **kwargs) -> None:  # noqa: D401
+        pass
+
+
 def _serve(handler_cls):
     server = HTTPServer(("127.0.0.1", 0), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -118,15 +149,26 @@ def good_and_bad_servers():
         bad_thread.join(timeout=1)
 
 
-def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, good_url: str, bad_url: str):
-    """Runs a good then a regressed evaluation, with commit capture mocked.
+@pytest.fixture()
+def toggle_server():
+    _ToggleHandler.answer_correctly = True
+    server, thread, url = _serve(_ToggleHandler)
+    try:
+        yield url
+    finally:
+        server.shutdown()
+        thread.join(timeout=1)
+
+
+def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, agent_url: str):
+    """Runs a good then a regressed evaluation against the *same* agent
+    URL and dataset (only the toggle server's behavior differs between
+    them), with commit capture mocked.
 
     Returns (baseline_result, current_result, current_dir).
     """
-    baseline_dataset = tmp_path / "dataset-v1.jsonl"
-    current_dataset = tmp_path / "dataset-v2.jsonl"
-    _write_dataset(baseline_dataset)
-    _write_dataset(current_dataset)
+    dataset_path = tmp_path / "dataset.jsonl"
+    _write_dataset(dataset_path)
 
     commits = iter([_fake_commit("a" * 40), _fake_commit("b" * 40)])
     monkeypatch.setattr(
@@ -134,9 +176,10 @@ def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, good_url: str, bad
     )
 
     baseline_config_path = tmp_path / "agentops-baseline.yaml"
-    _write_config(baseline_config_path, agent_url=good_url, dataset=baseline_dataset)
+    _write_config(baseline_config_path, agent_url=agent_url, dataset=dataset_path)
     baseline_config = load_agentops_config(baseline_config_path)
 
+    _ToggleHandler.answer_correctly = True
     baseline_dir = tmp_path / "baseline"
     baseline_result = run_evaluation(
         baseline_config,
@@ -148,9 +191,10 @@ def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, good_url: str, bad
     )
 
     current_config_path = tmp_path / "agentops-current.yaml"
-    _write_config(current_config_path, agent_url=bad_url, dataset=current_dataset)
+    _write_config(current_config_path, agent_url=agent_url, dataset=dataset_path)
     current_config = load_agentops_config(current_config_path)
 
+    _ToggleHandler.answer_correctly = False
     current_dir = tmp_path / "current"
     current_result = run_evaluation(
         current_config,
@@ -166,12 +210,10 @@ def _run_baseline_then_regressed(tmp_path: Path, monkeypatch, good_url: str, bad
 
 
 def test_regression_commit_attribution_end_to_end(
-    tmp_path: Path, monkeypatch, good_and_bad_servers
+    tmp_path: Path, monkeypatch, toggle_server
 ) -> None:
-    good_url, bad_url = good_and_bad_servers
-
     baseline_result, current_result, current_dir = _run_baseline_then_regressed(
-        tmp_path, monkeypatch, good_url, bad_url
+        tmp_path, monkeypatch, toggle_server
     )
 
     assert baseline_result.aggregate_metrics["f1_score"] == pytest.approx(1.0)
@@ -186,7 +228,11 @@ def test_regression_commit_attribution_end_to_end(
     assert len(insight.regressed_metrics) == 1
     assert insight.regressed_metrics[0].metric == "f1_score"
     assert insight.regressed_metrics[0].from_value == pytest.approx(1.0)
-    assert any(c.field == "dataset" for c in insight.changed_inputs)
+    # Same agent/dataset/evaluators on both sides (FR-005 comparability) -
+    # only the toggle server's behavior differs, which build_changed_inputs
+    # has no way to see, so there is no tracked "changed input" here; the
+    # explanation still names the metric's before/after values.
+    assert insight.changed_inputs == []
 
     report_text = (current_dir / "report.md").read_text(encoding="utf-8")
     assert "## Regression Insight" in report_text
@@ -199,16 +245,14 @@ def test_regression_commit_attribution_end_to_end(
 
 
 def test_regression_commit_attribution_purely_local(
-    tmp_path: Path, monkeypatch, good_and_bad_servers
+    tmp_path: Path, monkeypatch, toggle_server
 ) -> None:
     """The same outcome holds with no CI env vars - commit resolved via local git."""
-    good_url, bad_url = good_and_bad_servers
-
     for env_var in ("GITHUB_SHA", "BUILD_SOURCEVERSION", "Build.SourceVersion"):
         monkeypatch.delenv(env_var, raising=False)
 
     _baseline_result, current_result, current_dir = _run_baseline_then_regressed(
-        tmp_path, monkeypatch, good_url, bad_url
+        tmp_path, monkeypatch, toggle_server
     )
 
     # Commit capture itself is mocked here (as in the CI-style test above) to
